@@ -1,0 +1,15 @@
+[server]
+# Disable the source-file watcher — it walks every submodule of `transformers`,
+# which lazy-imports torchvision-dependent image processors and floods the
+# terminal with ModuleNotFoundError tracebacks. We don't need live reload.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#818CF8"              # indigo-400 — readable accent on dark bg
+backgroundColor = "#0F172A"           # slate-900
+secondaryBackgroundColor = "#1E293B"  # slate-800 — sidebar + inputs
+textColor = "#E2E8F0"                 # slate-200
