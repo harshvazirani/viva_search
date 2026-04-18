@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(python3 *)",
-      "Bash(pip3 install *)"
+      "Bash(pip3 install *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(./.venv/bin/python *)",
+      "Bash(./.venv/bin/streamlit run *)",
+      "Bash(curl *)",
+      "Bash(kill %1)",
+      "Bash(pkill -f \"streamlit run app.py\")"
     ]
   }
 }
