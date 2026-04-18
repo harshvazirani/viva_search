@@ -84,42 +84,21 @@ _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _PAGE_MARKER = re.compile(r"⟪PAGE=(\d+)⟫")
 
 
-def _paragraph_page_breaks(element) -> Tuple[int, int]:
-    """Count page breaks in a paragraph, split by position relative to text.
+def _count_page_breaks(element) -> int:
+    """Number of page boundaries that occur inside a WordML element.
 
-    Returns ``(leading, trailing)``:
-      * ``leading`` — breaks that occur before any visible text in the
-        paragraph. These mean the paragraph *starts* on the next page, so
-        the page counter must advance **before** we tag this paragraph.
-      * ``trailing`` — breaks that occur after text has appeared. The
-        paragraph's first line belongs to the current page; the counter
-        advances **after** we tag it.
-
-    The split matters because Word writes ``<w:lastRenderedPageBreak/>`` at
-    the start of the first run of the first paragraph on each new page.
-    Counting all breaks as trailing (the previous implementation) shifted
-    every boundary paragraph onto the page before its real one.
+    ``w:lastRenderedPageBreak`` is written by Word/LibreOffice after each
+    save-and-render — it's absent if the file was generated programmatically
+    and never opened in a word processor. ``w:br w:type='page'`` is the
+    explicit page break a user inserts with Ctrl-Enter.
     """
-    leading = 0
-    trailing = 0
-    seen_text = False
-    for node in element.iter():
-        tag = node.tag
-        if tag == f"{_W_NS}t" and node.text:
-            seen_text = True
-        elif tag == f"{_W_NS}tab":
-            seen_text = True
-        elif tag == f"{_W_NS}lastRenderedPageBreak":
-            if seen_text:
-                trailing += 1
-            else:
-                leading += 1
-        elif tag == f"{_W_NS}br" and node.get(f"{_W_NS}type") == "page":
-            if seen_text:
-                trailing += 1
-            else:
-                leading += 1
-    return leading, trailing
+    count = 0
+    for child in element.iter():
+        if child.tag == f"{_W_NS}lastRenderedPageBreak":
+            count += 1
+        elif child.tag == f"{_W_NS}br" and child.get(f"{_W_NS}type") == "page":
+            count += 1
+    return count
 
 
 def _iter_paragraphs_in_order(doc):
@@ -144,10 +123,8 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     lines: List[str] = []
     current_page = 1
     for para in _iter_paragraphs_in_order(doc):
-        leading, trailing = _paragraph_page_breaks(para._element)
-        current_page += leading
         lines.append(f"⟪PAGE={current_page}⟫{para.text}")
-        current_page += trailing
+        current_page += _count_page_breaks(para._element)
     return "\n".join(lines)
 
 
