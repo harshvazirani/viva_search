@@ -6,4 +6,3 @@ __pycache__/
 .env
 .streamlit/secrets.toml
 .cache/
-sample_qa.docx
