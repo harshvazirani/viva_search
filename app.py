@@ -63,7 +63,7 @@ def _clear_cache() -> None:
 
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-TOP_K = 3
+TOP_K = 6
 MAX_WORDS_PER_CHUNK = 500
 
 
@@ -308,10 +308,13 @@ def _render_best_match(chunk: str) -> None:
 
 
 def _render_secondary(chunk: str, rank: int) -> None:
-    """Collapsed expander — secondary results and browse list entries."""
+    """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
     with st.expander(f"**#{rank}** — {q}", expanded=False):
-        st.markdown(_md_preserve_breaks(a))
+        st.markdown(
+            f'<div class="best-answer">{_answer_html(a)}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
