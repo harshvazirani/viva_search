@@ -20,9 +20,6 @@ from typing import List, Optional, Tuple
 import faiss
 import streamlit as st
 from docx import Document
-from docx.oxml.ns import qn
-from docx.table import Table
-from docx.text.paragraph import Paragraph
 from sentence_transformers import SentenceTransformer
 
 
@@ -66,8 +63,7 @@ def _clear_cache() -> None:
 
 
 MODEL_NAME = "all-MiniLM-L6-v2"
-DEFAULT_TOP_K = 6
-MAX_TOP_K = 20
+TOP_K = 6
 MAX_WORDS_PER_CHUNK = 500
 
 
@@ -75,56 +71,19 @@ MAX_WORDS_PER_CHUNK = 500
 # .docx parsing
 # ---------------------------------------------------------------------------
 
-# WordprocessingML namespace prefix used on every tag in a .docx body.
-_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-
-# Each paragraph's text is prefixed with ⟪PAGE=N⟫ during extraction so page
-# info survives normalization and Q/A splitting. Uncommon Unicode brackets
-# make false positives in user content essentially impossible.
-_PAGE_MARKER = re.compile(r"⟪PAGE=(\d+)⟫")
-
-
-def _count_page_breaks(element) -> int:
-    """Number of page boundaries that occur inside a WordML element.
-
-    ``w:lastRenderedPageBreak`` is written by Word/LibreOffice after each
-    save-and-render — it's absent if the file was generated programmatically
-    and never opened in a word processor. ``w:br w:type='page'`` is the
-    explicit page break a user inserts with Ctrl-Enter.
-    """
-    count = 0
-    for child in element.iter():
-        if child.tag == f"{_W_NS}lastRenderedPageBreak":
-            count += 1
-        elif child.tag == f"{_W_NS}br" and child.get(f"{_W_NS}type") == "page":
-            count += 1
-    return count
-
-
-def _iter_paragraphs_in_order(doc):
-    """Yield every paragraph in document order, flattening tables into cells."""
-    for child in doc.element.body.iterchildren():
-        if child.tag == qn("w:p"):
-            yield Paragraph(child, doc)
-        elif child.tag == qn("w:tbl"):
-            for row in Table(child, doc).rows:
-                for cell in row.cells:
-                    yield from cell.paragraphs
-
-
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Extract full text, prefixing each paragraph with a ⟪PAGE=N⟫ marker.
-
-    Page numbers come from ``w:lastRenderedPageBreak`` + explicit page breaks
-    in document order. If the file has no break info (never rendered), every
-    paragraph is tagged page 1 and the UI hides the page badge.
-    """
+    """Extract full text from a .docx file, preserving line breaks."""
     doc = Document(io.BytesIO(file_bytes))
     lines: List[str] = []
-    current_page = 1
-    for para in _iter_paragraphs_in_order(doc):
-        lines.append(f"⟪PAGE={current_page}⟫{para.text}")
-        current_page += _count_page_breaks(para._element)
+    for para in doc.paragraphs:
+        # Keep empty paragraphs so blank lines between Q/A blocks survive.
+        lines.append(para.text)
+    # Some Q&A docs stash content in tables — pull that too.
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    lines.append(para.text)
     return "\n".join(lines)
 
 
@@ -134,10 +93,8 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 
 # Question boundary: line start with Q:, Q -, Question:, or "1. " numbering.
 # Whitespace allowed between letter and separator so "q - foo" works.
-# The optional ⟪PAGE=N⟫ group lets the boundary survive after page tagging.
 _Q_BOUNDARY = re.compile(
-    r"(?:^|\n)(?:⟪PAGE=\d+⟫)?[ \t]*"
-    r"(?:Question[ \t]*[:\-]?|Q[ \t]*[:\-]|\d+\.\s)",
+    r"(?:^|\n)[ \t]*(?:Question[ \t]*[:\-]?|Q[ \t]*[:\-]|\d+\.\s)",
     re.IGNORECASE,
 )
 
@@ -168,17 +125,15 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
-def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
-    """Split text into ``(Q: ...\\nA: ..., page_number)`` tuples per Q/A block.
+def extract_qa_pairs(text: str) -> List[str]:
+    """Split text into one ``Q: ...\\nA: ...`` string per Q/A block.
 
     Strategy:
-      1. Normalize whitespace (⟪PAGE=N⟫ markers survive intact).
+      1. Normalize whitespace.
       2. Detect question boundaries (Q:, Question:, numbered).
-      3. Read the first ⟪PAGE=N⟫ inside each block — that's the page the
-         question line starts on.
-      4. Strip all page markers, then split on the first line-start A: marker.
-         If none, fall back to "first line = question, rest = answer".
-      5. Drop genuinely empty halves so the index stays clean.
+      3. Inside each block, split on the first line-start A: marker. If none,
+         fall back to "first line = question, rest = answer".
+      4. Drop genuinely empty halves so the index stays clean.
     """
     text = _normalize(text)
     if not text:
@@ -188,18 +143,12 @@ def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
     if not matches:
         return []
 
-    pairs: List[Tuple[str, int]] = []
+    pairs: List[str] = []
     for i, m in enumerate(matches):
         # Skip the leading newline captured by (?:^|\n) but keep the marker.
         start = m.start() + (1 if text[m.start()] == "\n" else 0)
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         chunk = text[start:end].strip()
-        if not chunk:
-            continue
-
-        page_match = _PAGE_MARKER.search(chunk)
-        page = int(page_match.group(1)) if page_match else 1
-        chunk = _PAGE_MARKER.sub("", chunk).strip()
         if not chunk:
             continue
 
@@ -218,7 +167,7 @@ def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
         answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
 
         if len(question) >= 3 and len(answer) >= 1:
-            pairs.append((f"Q: {question}\nA: {answer}", page))
+            pairs.append(f"Q: {question}\nA: {answer}")
 
     return pairs
 
@@ -272,20 +221,11 @@ def _split_long_chunk(chunk: str, max_words: int = MAX_WORDS_PER_CHUNK) -> List[
     return parts or [chunk]
 
 
-def build_chunks(text: str) -> Tuple[List[str], List[int]]:
-    """Return parallel lists: Q&A text chunks and the page each one starts on.
-
-    When one Q/A block is split into multiple sub-chunks for length, each
-    sub-chunk inherits the original block's starting page — good enough for
-    "jump to this section of the PDF" UX.
-    """
+def build_chunks(text: str) -> List[str]:
     chunks: List[str] = []
-    pages: List[int] = []
-    for block, page in extract_qa_pairs(text):
-        for sub in _split_long_chunk(block):
-            chunks.append(sub)
-            pages.append(page)
-    return chunks, pages
+    for block in extract_qa_pairs(text):
+        chunks.extend(_split_long_chunk(block))
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +253,11 @@ def search(
     docs: List[str],
     index: faiss.Index,
     model: SentenceTransformer,
-    k: int = DEFAULT_TOP_K,
-) -> List[int]:
-    """Return the indices of the top-k matching docs, best first."""
+    k: int = TOP_K,
+) -> List[str]:
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
     _distances, ids = index.search(q_emb, min(k, len(docs)))
-    return [int(i) for i in ids[0] if i >= 0]
+    return [docs[i] for i in ids[0] if i >= 0]
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +293,10 @@ def _answer_html(a: str) -> str:
     return "".join(out_paragraphs)
 
 
-def _render_best_match(chunk: str, page: Optional[int]) -> None:
+def _render_best_match(chunk: str) -> None:
     """Large bordered card — the primary result, with bigger body text."""
     q, a = _split_qa(chunk)
     with st.container(border=True):
-        if page is not None:
-            st.markdown(
-                f'<div class="page-badge">Page {page}</div>',
-                unsafe_allow_html=True,
-            )
         st.markdown(
             f'<div class="best-question">{html.escape(q)}</div>',
             unsafe_allow_html=True,
@@ -373,22 +307,14 @@ def _render_best_match(chunk: str, page: Optional[int]) -> None:
         )
 
 
-def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
-    """Collapsed row — uses a native <details> element so we can attach a
-    CSS-driven hover tooltip (`data-page` + `::after`). Streamlit's built-in
-    expander doesn't expose a tooltip API in this version, and the browser's
-    native `title=` tooltip has a long delay that feels broken."""
+def _render_secondary(chunk: str, rank: int) -> None:
+    """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
-    tooltip_attr = f' data-page="Page {page}"' if page is not None else ""
-    label = f"<strong>#{rank}</strong> — {html.escape(q)}"
-    body = _answer_html(a)
-    st.markdown(
-        f'<details class="qa-secondary"{tooltip_attr}>'
-        f'<summary>{label}</summary>'
-        f'<div class="best-answer qa-secondary-body">{body}</div>'
-        f'</details>',
-        unsafe_allow_html=True,
-    )
+    with st.expander(f"**#{rank}** — {q}", expanded=False):
+        st.markdown(
+            f'<div class="best-answer">{_answer_html(a)}</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -442,20 +368,6 @@ st.markdown(
         margin-bottom: 0.85rem;
     }
 
-    /* Page badge — small pill above the best-match question */
-    .page-badge {
-        display: inline-block;
-        font-size: 0.78rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.07em;
-        margin-bottom: 0.7rem;
-        padding: 0.2rem 0.65rem;
-        border-radius: 999px;
-        background: rgba(127, 127, 127, 0.12);
-        opacity: 0.95;
-    }
-
     /* Best-match answer body — this is the main size bump */
     .best-answer {
         font-size: 1.15rem;
@@ -481,63 +393,6 @@ st.markdown(
         padding-top: 0.55rem;
         padding-bottom: 0.55rem;
         font-size: 0.95rem;
-    }
-
-    /* Custom <details> rows used for secondary matches — styled to match
-       Streamlit's own expander so the two coexist visually. */
-    details.qa-secondary {
-        position: relative;
-        border: 1px solid rgba(128, 128, 128, 0.22);
-        border-radius: 10px;
-        padding: 0.55rem 1rem;
-        margin-bottom: 0.5rem;
-        background: transparent;
-    }
-    details.qa-secondary > summary {
-        cursor: pointer;
-        list-style: none;
-        font-size: 0.95rem;
-        padding: 0.1rem 0;
-    }
-    details.qa-secondary > summary::-webkit-details-marker { display: none; }
-    details.qa-secondary > summary::before {
-        content: "▸";
-        display: inline-block;
-        width: 1rem;
-        margin-right: 0.35rem;
-        opacity: 0.55;
-        transition: transform 0.15s ease;
-    }
-    details.qa-secondary[open] > summary::before {
-        transform: rotate(90deg);
-    }
-    details.qa-secondary > .qa-secondary-body {
-        margin-top: 0.75rem;
-    }
-
-    /* Instant CSS tooltip — reveals "Page N" in the top-right corner on hover.
-       `title=` was too slow (browsers delay ~1s); `data-page` + ::after fires
-       immediately and is also visible while the row is expanded. */
-    details.qa-secondary[data-page]::after {
-        content: attr(data-page);
-        position: absolute;
-        top: 0.5rem;
-        right: 0.75rem;
-        font-size: 0.7rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        padding: 0.15rem 0.5rem;
-        border-radius: 999px;
-        background: rgba(0, 0, 0, 0.75);
-        color: #fff;
-        pointer-events: none;
-        opacity: 0;
-        transition: opacity 0.12s ease;
-    }
-    details.qa-secondary[data-page]:hover::after,
-    details.qa-secondary[data-page]:focus-within::after {
-        opacity: 1;
     }
 
     /* Sidebar polish */
@@ -669,7 +524,7 @@ if st.session_state.get("file_hash") != active_hash:
         st.error(f"Failed to parse .docx file: {e}")
         st.stop()
 
-    docs, pages = build_chunks(raw_text)
+    docs = build_chunks(raw_text)
     if not docs:
         st.warning(
             "No Q&A pairs detected. Make sure the document uses `Q:` and `A:` "
@@ -681,27 +536,13 @@ if st.session_state.get("file_hash") != active_hash:
     with st.spinner(f"Indexing {len(docs)} Q&A chunks..."):
         index = build_index(docs, model)
 
-    # Only surface pages if the document actually has break info. A doc that
-    # was never rendered has every paragraph tagged page 1 — showing "Page 1"
-    # on every result would be noise, not signal.
-    page_count = max(pages) if pages else 1
-    has_pages = page_count > 1
-
     st.session_state.file_hash = active_hash
     st.session_state.docs = docs
-    st.session_state.pages = pages
     st.session_state.index = index
-    st.session_state.doc_info = {
-        "name": active_name,
-        "chunks": len(docs),
-        "has_pages": has_pages,
-        "page_count": page_count,
-    }
+    st.session_state.doc_info = {"name": active_name, "chunks": len(docs)}
 
 docs = st.session_state.docs
-pages = st.session_state.pages
 index = st.session_state.index
-has_pages = st.session_state.doc_info["has_pages"]
 model = load_model()
 
 # Populate the sidebar's info placeholder now that the doc is ready.
@@ -709,31 +550,8 @@ with sidebar_info.container():
     info = st.session_state["doc_info"]
     st.caption(f"**{info['name']}**")
     st.caption(f"{info['chunks']} Q&A chunks indexed")
-    if info["has_pages"]:
-        n = info["page_count"]
-        st.caption(f"_{n} pages detected_" if n != 1 else "_1 page detected_")
     if from_cache:
         st.caption("_Loaded from local cache_")
-
-    # Let the user tune how many matches to show. Cap at MAX_TOP_K so the
-    # results list stays scannable; also cap at chunk count (can't return
-    # more matches than exist).
-    _k_max = max(1, min(MAX_TOP_K, info["chunks"]))
-    _k_default = min(DEFAULT_TOP_K, _k_max)
-    # Clamp any stale session value left over from a larger previous doc,
-    # otherwise Streamlit raises when the saved value exceeds max_value.
-    if st.session_state.get("top_k", 0) > _k_max:
-        st.session_state["top_k"] = _k_max
-    if _k_max > 1:
-        top_k = st.slider(
-            "Matches to show",
-            min_value=1,
-            max_value=_k_max,
-            value=_k_default,
-            key="top_k",
-        )
-    else:
-        top_k = 1
 
 query = st.text_input(
     "Search",
@@ -741,21 +559,17 @@ query = st.text_input(
     label_visibility="collapsed",
 )
 
-def _page_for(idx: int) -> Optional[int]:
-    return pages[idx] if has_pages else None
-
-
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
-    result_ids = search(query, docs, index, model, k=top_k)
-    if result_ids:
+    results = search(query, docs, index, model)
+    if results:
         st.markdown("##### Best match")
-        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
-        if len(result_ids) > 1:
+        _render_best_match(results[0])
+        if len(results) > 1:
             st.markdown("")
             st.markdown("##### Other matches")
-            for rank, idx in enumerate(result_ids[1:], start=2):
-                _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
+            for i, chunk in enumerate(results[1:], start=2):
+                _render_secondary(chunk, rank=i)
     else:
         st.caption("No matches.")
 else:
@@ -766,4 +580,4 @@ else:
     )
     st.markdown("##### Browse all")
     for i, chunk in enumerate(docs, start=1):
-        _render_secondary(chunk, rank=i, page=_page_for(i - 1))
+        _render_secondary(chunk, rank=i)
