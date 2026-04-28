@@ -88,15 +88,25 @@ _PAGE_MARKER = re.compile(r"⟪PAGE=(\d+)⟫")
 _BULLET_PREFIX = "⟦•⟧ "
 
 
-def _paragraph_page_breaks(element) -> Tuple[int, int]:
+def _paragraph_page_breaks(element, use_rendered: bool) -> Tuple[int, int]:
     """Count page breaks in a paragraph, split by position relative to text.
 
     Word writes ``<w:lastRenderedPageBreak/>`` at the start of the first run
-    of the first paragraph on each new page. Splitting into ``leading``
-    (before any visible text) and ``trailing`` (after text) lets us advance
-    the page counter at the right moment instead of mis-attributing the
-    boundary paragraph to the previous page.
+    of the first paragraph on each new page — for **both** automatic and
+    manual page breaks. If we also counted the user's ``<w:br type="page"/>``,
+    every manual break would be counted twice. So:
+
+      * ``use_rendered=True`` (doc was opened in Word at least once) → trust
+        only ``lastRenderedPageBreak`` markers; ignore ``<w:br>``.
+      * ``use_rendered=False`` (never rendered) → count explicit ``<w:br>``.
+
+    Splitting into ``leading`` (before any visible text in the paragraph)
+    and ``trailing`` (after text) lets us advance the page counter at the
+    right moment instead of mis-attributing the boundary paragraph.
     """
+    target = (
+        f"{_W_NS}lastRenderedPageBreak" if use_rendered else None
+    )
     leading = 0
     trailing = 0
     seen_text = False
@@ -106,12 +116,16 @@ def _paragraph_page_breaks(element) -> Tuple[int, int]:
             seen_text = True
         elif tag == f"{_W_NS}tab":
             seen_text = True
-        elif tag == f"{_W_NS}lastRenderedPageBreak":
+        elif use_rendered and tag == target:
             if seen_text:
                 trailing += 1
             else:
                 leading += 1
-        elif tag == f"{_W_NS}br" and node.get(f"{_W_NS}type") == "page":
+        elif (
+            not use_rendered
+            and tag == f"{_W_NS}br"
+            and node.get(f"{_W_NS}type") == "page"
+        ):
             if seen_text:
                 trailing += 1
             else:
@@ -147,10 +161,15 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     paragraph is tagged page 1 and the UI hides the page badge.
     """
     doc = Document(io.BytesIO(file_bytes))
+    # Decide once per doc which break signal to trust. lastRenderedPageBreak
+    # covers both auto and manual breaks — but only exists if the doc has
+    # been opened in Word/LibreOffice at least once.
+    body_xml = doc.element.body
+    use_rendered = body_xml.find(f".//{_W_NS}lastRenderedPageBreak") is not None
     lines: List[str] = []
     current_page = 1
     for para in _iter_paragraphs_in_order(doc):
-        leading, trailing = _paragraph_page_breaks(para._element)
+        leading, trailing = _paragraph_page_breaks(para._element, use_rendered)
         current_page += leading
         body = para.text
         if _is_list_paragraph(para) and body.strip():
