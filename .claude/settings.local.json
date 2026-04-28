@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(python3 *)",
-      "Bash(pip3 install *)"
+      "Bash(pip3 install *)",
+      "Read(//private/tmp/**)",
+      "Bash(cp \"/Users/harshvazirani/Desktop/QnA Sample.docx\" sample.docx)",
+      "Bash(unzip -o sample.docx -d sample_extracted)",
+      "Bash(./.venv/bin/python *)",
+      "Bash(pkill -f \"streamlit run app.py\")",
+      "Bash(./.venv/bin/streamlit run *)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8501/)",
+      "Read(//tmp/**)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

@@ -20,6 +20,9 @@ from typing import List, Optional, Tuple
 import faiss
 import streamlit as st
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from sentence_transformers import SentenceTransformer
 
 
@@ -64,6 +67,8 @@ def _clear_cache() -> None:
 
 MODEL_NAME = "all-MiniLM-L6-v2"
 TOP_K = 6
+DEFAULT_TOP_K = 6
+MAX_TOP_K = 20
 MAX_WORDS_PER_CHUNK = 500
 
 
@@ -71,19 +76,87 @@ MAX_WORDS_PER_CHUNK = 500
 # .docx parsing
 # ---------------------------------------------------------------------------
 
+_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+# Page tag prefixed onto each paragraph so page info survives normalization
+# and Q/A splitting. Uncommon Unicode brackets make false positives in user
+# content essentially impossible.
+_PAGE_MARKER = re.compile(r"⟪PAGE=(\d+)⟫")
+
+# Sentinel that flags a paragraph as a list/bullet item. Stripped before
+# search; the answer renderer turns runs of these into a real <ul>.
+_BULLET_PREFIX = "⟦•⟧ "
+
+
+def _paragraph_page_breaks(element) -> Tuple[int, int]:
+    """Count page breaks in a paragraph, split by position relative to text.
+
+    Word writes ``<w:lastRenderedPageBreak/>`` at the start of the first run
+    of the first paragraph on each new page. Splitting into ``leading``
+    (before any visible text) and ``trailing`` (after text) lets us advance
+    the page counter at the right moment instead of mis-attributing the
+    boundary paragraph to the previous page.
+    """
+    leading = 0
+    trailing = 0
+    seen_text = False
+    for node in element.iter():
+        tag = node.tag
+        if tag == f"{_W_NS}t" and node.text:
+            seen_text = True
+        elif tag == f"{_W_NS}tab":
+            seen_text = True
+        elif tag == f"{_W_NS}lastRenderedPageBreak":
+            if seen_text:
+                trailing += 1
+            else:
+                leading += 1
+        elif tag == f"{_W_NS}br" and node.get(f"{_W_NS}type") == "page":
+            if seen_text:
+                trailing += 1
+            else:
+                leading += 1
+    return leading, trailing
+
+
+def _is_list_paragraph(para: Paragraph) -> bool:
+    """True if the paragraph is a bulleted/numbered list item in Word."""
+    if para._element.find(f".//{_W_NS}numPr") is not None:
+        return True
+    style = para.style.name if para.style is not None else ""
+    return style == "List Paragraph"
+
+
+def _iter_paragraphs_in_order(doc):
+    """Yield every paragraph in document order, flattening tables into cells."""
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            for row in Table(child, doc).rows:
+                for cell in row.cells:
+                    yield from cell.paragraphs
+
+
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    """Extract full text from a .docx file, preserving line breaks."""
+    """Extract text, prefixing each paragraph with a ⟪PAGE=N⟫ tag and
+    marking list items with a sentinel so the renderer can rebuild bullets.
+
+    Page numbers come from ``w:lastRenderedPageBreak`` + explicit page breaks
+    in document order. If the file has no break info (never rendered), every
+    paragraph is tagged page 1 and the UI hides the page badge.
+    """
     doc = Document(io.BytesIO(file_bytes))
     lines: List[str] = []
-    for para in doc.paragraphs:
-        # Keep empty paragraphs so blank lines between Q/A blocks survive.
-        lines.append(para.text)
-    # Some Q&A docs stash content in tables — pull that too.
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    lines.append(para.text)
+    current_page = 1
+    for para in _iter_paragraphs_in_order(doc):
+        leading, trailing = _paragraph_page_breaks(para._element)
+        current_page += leading
+        body = para.text
+        if _is_list_paragraph(para) and body.strip():
+            body = f"{_BULLET_PREFIX}{body.lstrip()}"
+        lines.append(f"⟪PAGE={current_page}⟫{body}")
+        current_page += trailing
     return "\n".join(lines)
 
 
@@ -92,9 +165,10 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 # Question boundary: line start with Q:, Q -, Question:, or "1. " numbering.
-# Whitespace allowed between letter and separator so "q - foo" works.
+# The optional ⟪PAGE=N⟫ group lets the boundary survive after page tagging.
 _Q_BOUNDARY = re.compile(
-    r"(?:^|\n)[ \t]*(?:Question[ \t]*[:\-]?|Q[ \t]*[:\-]|\d+\.\s)",
+    r"(?:^|\n)(?:⟪PAGE=\d+⟫)?[ \t]*"
+    r"(?:Question[ \t]*[:\-]?|Q[ \t]*[:\-]|\d+\.\s)",
     re.IGNORECASE,
 )
 
@@ -125,15 +199,12 @@ def _normalize(text: str) -> str:
     return text.strip()
 
 
-def extract_qa_pairs(text: str) -> List[str]:
-    """Split text into one ``Q: ...\\nA: ...`` string per Q/A block.
+def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
+    """Split text into ``(Q: ...\\nA: ..., page_number)`` tuples per block.
 
-    Strategy:
-      1. Normalize whitespace.
-      2. Detect question boundaries (Q:, Question:, numbered).
-      3. Inside each block, split on the first line-start A: marker. If none,
-         fall back to "first line = question, rest = answer".
-      4. Drop genuinely empty halves so the index stays clean.
+    Page comes from the first ⟪PAGE=N⟫ marker inside the block (= the page
+    the question line starts on). Markers are stripped from the stored
+    chunk; bullet sentinels survive into rendering.
     """
     text = _normalize(text)
     if not text:
@@ -143,12 +214,31 @@ def extract_qa_pairs(text: str) -> List[str]:
     if not matches:
         return []
 
-    pairs: List[str] = []
+    pairs: List[Tuple[str, int]] = []
     for i, m in enumerate(matches):
         # Skip the leading newline captured by (?:^|\n) but keep the marker.
         start = m.start() + (1 if text[m.start()] == "\n" else 0)
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         chunk = text[start:end].strip()
+        if not chunk:
+            continue
+
+        # Page = where the answer body starts. Word writes
+        # ``lastRenderedPageBreak`` at the first run that physically lands on
+        # the new page, which is often the first answer bullet — even when
+        # the Q line itself was visually pushed to that new page. Anchoring
+        # on the answer body matches what the user sees in Word.
+        a_anchor = re.search(
+            r"(?m)^(?:⟪PAGE=\d+⟫)?[ \t]*A(?:ns(?:wer)?)?[ \t]*[:\-]",
+            chunk,
+        )
+        search_from = a_anchor.end() if a_anchor else 0
+        page_match = (
+            _PAGE_MARKER.search(chunk, search_from)
+            or _PAGE_MARKER.search(chunk)
+        )
+        page = int(page_match.group(1)) if page_match else 1
+        chunk = _PAGE_MARKER.sub("", chunk).strip()
         if not chunk:
             continue
 
@@ -167,7 +257,7 @@ def extract_qa_pairs(text: str) -> List[str]:
         answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
 
         if len(question) >= 3 and len(answer) >= 1:
-            pairs.append(f"Q: {question}\nA: {answer}")
+            pairs.append((f"Q: {question}\nA: {answer}", page))
 
     return pairs
 
@@ -221,11 +311,15 @@ def _split_long_chunk(chunk: str, max_words: int = MAX_WORDS_PER_CHUNK) -> List[
     return parts or [chunk]
 
 
-def build_chunks(text: str) -> List[str]:
+def build_chunks(text: str) -> Tuple[List[str], List[int]]:
+    """Return parallel lists: Q&A chunks and the page each one starts on."""
     chunks: List[str] = []
-    for block in extract_qa_pairs(text):
-        chunks.extend(_split_long_chunk(block))
-    return chunks
+    pages: List[int] = []
+    for block, page in extract_qa_pairs(text):
+        for sub in _split_long_chunk(block):
+            chunks.append(sub)
+            pages.append(page)
+    return chunks, pages
 
 
 # ---------------------------------------------------------------------------
@@ -254,10 +348,11 @@ def search(
     index: faiss.Index,
     model: SentenceTransformer,
     k: int = TOP_K,
-) -> List[str]:
+) -> List[int]:
+    """Return indices of the top-k matching docs, best first."""
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
     _distances, ids = index.search(q_emb, min(k, len(docs)))
-    return [docs[i] for i in ids[0] if i >= 0]
+    return [int(i) for i in ids[0] if i >= 0]
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +364,8 @@ def _split_qa(chunk: str) -> tuple[str, str]:
     lines = chunk.split("\n", 1)
     q = lines[0]
     a = lines[1] if len(lines) > 1 else ""
-    q = re.sub(r"^\s*Q[:\-\s]*", "", q, flags=re.IGNORECASE).strip()
+    q = re.sub(r"^\s*Q[:\-\s]*", "", q, flags=re.IGNORECASE)
+    q = q.replace(_BULLET_PREFIX, "").strip()
     a = re.sub(r"^\s*A(?:ns(?:wer)?)?[:\-\s]*", "", a, flags=re.IGNORECASE).strip()
     return q, a
 
@@ -281,22 +377,48 @@ def _md_preserve_breaks(text: str) -> str:
 
 
 def _answer_html(a: str) -> str:
-    """Convert a plain-text answer into HTML-safe paragraph markup."""
-    out_paragraphs = []
+    """Convert a plain-text answer into HTML-safe paragraph + list markup.
+
+    Lines tagged with the bullet sentinel become ``<li>`` items inside a
+    single ``<ul>``; consecutive bullets stay grouped. Other lines render
+    as ``<p>`` paragraphs as before.
+    """
+    out: List[str] = []
+    bullet_buf: List[str] = []
+
+    def flush_bullets() -> None:
+        if not bullet_buf:
+            return
+        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullet_buf)
+        out.append(f"<ul class='answer-list'>{items}</ul>")
+        bullet_buf.clear()
+
     for para in a.split("\n\n"):
         para = para.strip()
         if not para:
             continue
-        out_paragraphs.append(
-            "<p>" + html.escape(para).replace("\n", "<br>") + "</p>"
-        )
-    return "".join(out_paragraphs)
+        for line in para.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(_BULLET_PREFIX):
+                bullet_buf.append(stripped[len(_BULLET_PREFIX):].strip())
+            else:
+                flush_bullets()
+                out.append(f"<p>{html.escape(stripped)}</p>")
+        flush_bullets()
+    return "".join(out)
 
 
-def _render_best_match(chunk: str) -> None:
+def _render_best_match(chunk: str, page: Optional[int]) -> None:
     """Large bordered card — the primary result, with bigger body text."""
     q, a = _split_qa(chunk)
     with st.container(border=True):
+        if page is not None:
+            st.markdown(
+                f'<div class="page-badge">Page {page}</div>',
+                unsafe_allow_html=True,
+            )
         st.markdown(
             f'<div class="best-question">{html.escape(q)}</div>',
             unsafe_allow_html=True,
@@ -307,10 +429,11 @@ def _render_best_match(chunk: str) -> None:
         )
 
 
-def _render_secondary(chunk: str, rank: int) -> None:
+def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
     """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
-    with st.expander(f"**#{rank}** — {q}", expanded=False):
+    suffix = f"  ·  Page {page}" if page is not None else ""
+    with st.expander(f"**#{rank}** — {q}{suffix}", expanded=False):
         st.markdown(
             f'<div class="best-answer">{_answer_html(a)}</div>',
             unsafe_allow_html=True,
@@ -357,6 +480,32 @@ st.markdown(
         font-size: 1.05rem;
         padding: 0.85rem 1rem;
         border-radius: 10px;
+    }
+
+    /* Page badge — small pill above the best-match question */
+    .page-badge {
+        display: inline-block;
+        font-size: 0.78rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        margin-bottom: 0.7rem;
+        padding: 0.2rem 0.65rem;
+        border-radius: 999px;
+        background: rgba(127, 127, 127, 0.12);
+        opacity: 0.95;
+    }
+
+    /* Bulleted answer lists — match best-answer typography */
+    .best-answer ul.answer-list {
+        margin: 0 0 0.9em 0;
+        padding-left: 1.4rem;
+    }
+    .best-answer ul.answer-list li {
+        margin-bottom: 0.4em;
+    }
+    .best-answer ul.answer-list li:last-child {
+        margin-bottom: 0;
     }
 
     /* Best-match question heading */
@@ -524,7 +673,7 @@ if st.session_state.get("file_hash") != active_hash:
         st.error(f"Failed to parse .docx file: {e}")
         st.stop()
 
-    docs = build_chunks(raw_text)
+    docs, pages = build_chunks(raw_text)
     if not docs:
         st.warning(
             "No Q&A pairs detected. Make sure the document uses `Q:` and `A:` "
@@ -536,13 +685,27 @@ if st.session_state.get("file_hash") != active_hash:
     with st.spinner(f"Indexing {len(docs)} Q&A chunks..."):
         index = build_index(docs, model)
 
+    # Only surface pages if the document actually has break info. A doc that
+    # was never rendered tags every paragraph page 1 — showing "Page 1"
+    # everywhere would be noise, not signal.
+    page_count = max(pages) if pages else 1
+    has_pages = page_count > 1
+
     st.session_state.file_hash = active_hash
     st.session_state.docs = docs
+    st.session_state.pages = pages
     st.session_state.index = index
-    st.session_state.doc_info = {"name": active_name, "chunks": len(docs)}
+    st.session_state.doc_info = {
+        "name": active_name,
+        "chunks": len(docs),
+        "has_pages": has_pages,
+        "page_count": page_count,
+    }
 
 docs = st.session_state.docs
+pages = st.session_state.pages
 index = st.session_state.index
+has_pages = st.session_state.doc_info["has_pages"]
 model = load_model()
 
 # Populate the sidebar's info placeholder now that the doc is ready.
@@ -550,8 +713,30 @@ with sidebar_info.container():
     info = st.session_state["doc_info"]
     st.caption(f"**{info['name']}**")
     st.caption(f"{info['chunks']} Q&A chunks indexed")
+    if info["has_pages"]:
+        n = info["page_count"]
+        st.caption(f"_{n} pages detected_" if n != 1 else "_1 page detected_")
     if from_cache:
         st.caption("_Loaded from local cache_")
+
+    # Let the user tune how many matches to show. Cap at MAX_TOP_K so the
+    # results list stays scannable; also cap at chunk count.
+    _k_max = max(1, min(MAX_TOP_K, info["chunks"]))
+    _k_default = min(DEFAULT_TOP_K, _k_max)
+    # Clamp any stale session value left over from a previous larger doc,
+    # otherwise Streamlit raises when the saved value exceeds max_value.
+    if st.session_state.get("top_k", 0) > _k_max:
+        st.session_state["top_k"] = _k_max
+    if _k_max > 1:
+        top_k = st.slider(
+            "Matches to show",
+            min_value=1,
+            max_value=_k_max,
+            value=_k_default,
+            key="top_k",
+        )
+    else:
+        top_k = 1
 
 query = st.text_input(
     "Search",
@@ -559,17 +744,21 @@ query = st.text_input(
     label_visibility="collapsed",
 )
 
+def _page_for(idx: int) -> Optional[int]:
+    return pages[idx] if has_pages else None
+
+
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
-    results = search(query, docs, index, model)
-    if results:
+    result_ids = search(query, docs, index, model, k=top_k)
+    if result_ids:
         st.markdown("##### Best match")
-        _render_best_match(results[0])
-        if len(results) > 1:
+        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
+        if len(result_ids) > 1:
             st.markdown("")
             st.markdown("##### Other matches")
-            for i, chunk in enumerate(results[1:], start=2):
-                _render_secondary(chunk, rank=i)
+            for rank, idx in enumerate(result_ids[1:], start=2):
+                _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
     else:
         st.caption("No matches.")
 else:
@@ -580,4 +769,4 @@ else:
     )
     st.markdown("##### Browse all")
     for i, chunk in enumerate(docs, start=1):
-        _render_secondary(chunk, rank=i)
+        _render_secondary(chunk, rank=i, page=_page_for(i - 1))
