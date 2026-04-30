@@ -362,6 +362,27 @@ def build_index(docs: List[str], model: SentenceTransformer) -> faiss.Index:
     return index
 
 
+def build_q_index(docs: List[str], model: SentenceTransformer) -> faiss.Index:
+    """A second FAISS index over just the question line of each chunk.
+
+    Embedding the full chunk dilutes the question's signal across a long
+    answer body, so a paraphrase query like "method choice" can lose to a
+    chunk whose answer happens to mention method choices in passing. The
+    Q line is short and intent-bearing — usually carrying the parenthetical
+    keyword tags — so a separate index over it gives the semantic side a
+    Q-prioritized ranking that mirrors the BM25 Q-line boost.
+    """
+    q_lines = [d.split("\n", 1)[0] for d in docs]
+    embeddings = model.encode(
+        q_lines,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    ).astype("float32")
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index
+
+
 # Tokenizer for BM25. Lowercases, splits on non-alphanumerics, and strips
 # leading zeros from pure-digit tokens so "Case 03" and "Case 4" share the
 # vocabulary "case"/"3"/"4" — letting the user search "Case 4" and hit text
@@ -415,6 +436,7 @@ def search(
     query: str,
     docs: List[str],
     index: faiss.Index,
+    q_index: faiss.Index,
     bm25: BM25Okapi,
     model: SentenceTransformer,
     k: int = TOP_K,
@@ -492,8 +514,10 @@ def search(
         return ranked[:k]
 
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
-    _distances, faiss_ids = index.search(q_emb, pool)
-    semantic_ranking = [int(i) for i in faiss_ids[0] if i >= 0]
+    _d1, full_ids = index.search(q_emb, pool)
+    full_semantic_ranking = [int(i) for i in full_ids[0] if i >= 0]
+    _d2, q_ids = q_index.search(q_emb, pool)
+    q_semantic_ranking = [int(i) for i in q_ids[0] if i >= 0]
     # argsort descending; take only docs with positive score (a real lexical
     # hit). Zero-score docs would just be arbitrary tie-breaking noise.
     lexical_ranking = [
@@ -501,8 +525,14 @@ def search(
         if bm25_scores[i] > 0
     ][:pool]
 
+    # Three retrievers, fused with RRF. Q-line semantic and BM25 (Q-boosted)
+    # both target the question's intent — when the user paraphrases a
+    # tagged keyword, both reward the same chunk. Full-chunk semantic
+    # backs them up for queries whose meaning lives in the answer body.
     fused: dict[int, float] = {}
-    for rank, idx in enumerate(semantic_ranking):
+    for rank, idx in enumerate(q_semantic_ranking):
+        fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
+    for rank, idx in enumerate(full_semantic_ranking):
         fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
     for rank, idx in enumerate(lexical_ranking):
         fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
@@ -840,6 +870,7 @@ if st.session_state.get("file_hash") != active_hash:
     model = load_model()
     with st.spinner(f"Indexing {len(docs)} Q&A chunks..."):
         index = build_index(docs, model)
+        q_index = build_q_index(docs, model)
         bm25 = build_bm25(docs)
 
     # Only surface pages if the document actually has break info. A doc that
@@ -852,6 +883,7 @@ if st.session_state.get("file_hash") != active_hash:
     st.session_state.docs = docs
     st.session_state.pages = pages
     st.session_state.index = index
+    st.session_state.q_index = q_index
     st.session_state.bm25 = bm25
     st.session_state.doc_info = {
         "name": active_name,
@@ -863,6 +895,7 @@ if st.session_state.get("file_hash") != active_hash:
 docs = st.session_state.docs
 pages = st.session_state.pages
 index = st.session_state.index
+q_index = st.session_state.q_index
 bm25 = st.session_state.bm25
 has_pages = st.session_state.doc_info["has_pages"]
 model = load_model()
@@ -909,7 +942,7 @@ def _page_for(idx: int) -> Optional[int]:
 
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
-    result_ids = search(query, docs, index, bm25, model, k=top_k)
+    result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
     if result_ids:
         st.markdown("##### Best match")
         _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
