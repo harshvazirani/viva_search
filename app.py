@@ -460,15 +460,32 @@ def build_bm25(docs: List[str]) -> BM25Okapi:
     """
     corpus: List[List[str]] = []
     q_line_tokens: List[set] = []
+    chunk_token_lists: List[List[str]] = []
+    q_line_token_lists: List[List[str]] = []
     for d in docs:
         full = _tokenize(d)
         q_line = d.split("\n", 1)[0]
         q_toks = _tokenize(q_line)
         corpus.append(full + q_toks * _Q_LINE_BOOST)
         q_line_tokens.append(set(q_toks))
+        chunk_token_lists.append(full)
+        q_line_token_lists.append(q_toks)
     bm25 = BM25Okapi(corpus)
     bm25.q_line_tokens = q_line_tokens  # type: ignore[attr-defined]
+    bm25.chunk_tokens = chunk_token_lists  # type: ignore[attr-defined]
+    bm25.q_line_token_lists = q_line_token_lists  # type: ignore[attr-defined]
     return bm25
+
+
+def _phrase_indices(token_seq: List[str], phrase: List[str]) -> bool:
+    """True if phrase appears as a contiguous subsequence of token_seq."""
+    if len(phrase) < 2 or len(token_seq) < len(phrase):
+        return False
+    m = len(phrase)
+    for i in range(len(token_seq) - m + 1):
+        if token_seq[i:i + m] == phrase:
+            return True
+    return False
 
 
 # Reciprocal Rank Fusion constant. 60 is the value from the original Cormack
@@ -549,6 +566,25 @@ def search(
     bm25_query = _expand_synonyms(bm25_query)
     bm25_scores = bm25.get_scores(bm25_query)
 
+    # Phrase boost. "risk assessment" should outrank chunks where "risk"
+    # and "assessment" appear in different sentences. Detect chunks where
+    # the (stemmed) query tokens appear contiguously, with extra weight
+    # for a Q-line phrase hit since tags are the user's primary search
+    # surface. Only multi-token queries qualify; single tokens have
+    # nothing to "phrase".
+    phrase_q = [t for t in q_tokens if not t.isdigit()]
+    phrase_chunk_hits: set = set()
+    phrase_qline_hits: set = set()
+    if len(phrase_q) >= 2:
+        phrase_chunk_hits = {
+            i for i in range(n)
+            if _phrase_indices(bm25.chunk_tokens[i], phrase_q)
+        }
+        phrase_qline_hits = {
+            i for i in range(n)
+            if _phrase_indices(bm25.q_line_token_lists[i], phrase_q)
+        }
+
     # Identifier queries: rank prefiltered chunks by BM25 alone (semantic is
     # net-noise once the user has typed an explicit identifier — see
     # comment on `allowed` above). The strict pass returns the right top
@@ -557,10 +593,23 @@ def search(
     # would return only the one chunk whose Q line tags Chapter 4.
     identifier_top: List[int] = []
     if allowed is not None:
-        identifier_top = [
-            int(i) for i in bm25_scores.argsort()[::-1]
-            if int(i) in allowed and bm25_scores[i] > 0
+        # Phrase hits in the Q line jump to the top of the identifier list
+        # — e.g. "Case 13 power" should put the chunk whose Q line literally
+        # contains "case 13" above other Case-13-tagged chunks.
+        scored = [
+            (
+                int(i),
+                bm25_scores[i] + (
+                    2.0 if i in phrase_qline_hits
+                    else 1.0 if i in phrase_chunk_hits
+                    else 0.0
+                ),
+            )
+            for i in allowed
+            if bm25_scores[i] > 0
         ]
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        identifier_top = [i for i, _ in scored]
         if len(identifier_top) >= k:
             return identifier_top[:k]
 
@@ -607,6 +656,16 @@ def search(
         fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
     for rank, idx in enumerate(lexical_ranking):
         fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
+
+    # Phrase bonus: scaled to be on the order of a top RRF rank slot
+    # (1/_RRF_K ≈ 0.0167). A Q-line phrase match is worth a couple of
+    # rank-1 slots, a body phrase match worth one — enough to lift the
+    # phrase chunk past close competitors but not enough to override
+    # multiple stronger lexical/semantic signals.
+    for idx in phrase_qline_hits:
+        fused[idx] = fused.get(idx, 0.0) + 0.05
+    for idx in phrase_chunk_hits - phrase_qline_hits:
+        fused[idx] = fused.get(idx, 0.0) + 0.02
 
     ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
     hybrid_ranking = [idx for idx, _ in ordered]
@@ -862,21 +921,22 @@ st.markdown(
         opacity: 0.7;
     }
 
-    /* Search-term highlight — flashes bright on render, then settles to a
-       subtle tint so it draws the eye without staying loud. The animation
-       restarts on every search keystroke (Streamlit re-renders), so the
-       effect is inherently temporary: tied to the active query, not baked
-       into the doc. */
+    /* Search-term highlight — flashes bright on render, then fades fully
+       to transparent. The mark element stays in the DOM (good for screen
+       readers) but is visually gone after the animation completes, so the
+       highlight is truly temporary. Animation re-fires on every search
+       keystroke. */
     mark.search-hl {
-        background: rgba(255, 241, 118, 0.4);
+        background: transparent;
         color: inherit;
         padding: 0.05em 0.2em;
         border-radius: 3px;
-        animation: search-hl-flash 0.9s ease-out;
+        animation: search-hl-flash 2.4s ease-out forwards;
     }
     @keyframes search-hl-flash {
         0%   { background: rgba(255, 213, 79, 0.95); }
-        100% { background: rgba(255, 241, 118, 0.4); }
+        40%  { background: rgba(255, 213, 79, 0.85); }
+        100% { background: transparent; }
     }
 
     /* Hide Streamlit's auto-generated anchor links on markdown headings */
