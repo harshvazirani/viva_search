@@ -383,17 +383,63 @@ def build_q_index(docs: List[str], model: SentenceTransformer) -> faiss.Index:
     return index
 
 
-# Tokenizer for BM25. Lowercases, splits on non-alphanumerics, and strips
-# leading zeros from pure-digit tokens so "Case 03" and "Case 4" share the
-# vocabulary "case"/"3"/"4" — letting the user search "Case 4" and hit text
-# written as "Case 04". Without this, embedding-only search fares poorly on
-# short identifier queries because numerals carry weak semantic signal.
+# Tokenizer for BM25. Lowercases, splits on non-alphanumerics, strips
+# leading zeros from pure-digit tokens (so "Case 03" matches "Case 4"),
+# and folds simple English plurals so "limitations" ↔ "limitation",
+# "cases" ↔ "case", "studies" ↔ "study". Real morphological stemming
+# (Porter, Snowball) would handle more edge cases at the cost of an
+# extra dependency; the rules below cover the high-frequency forms
+# in this doc without misfiring on Latin/Greek -is/-us/-ss endings.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+_NO_STEM_ENDINGS = {"ss", "us", "is", "os", "as"}
+
+
+def _stem(token: str) -> str:
+    if len(token) <= 4 or token.isdigit():
+        return token
+    if token.endswith("ies"):
+        return token[:-3] + "y"
+    if token.endswith("s") and token[-2:] not in _NO_STEM_ENDINGS:
+        return token[:-1]
+    return token
 
 
 def _tokenize(text: str) -> List[str]:
-    tokens = _TOKEN_RE.findall(text.lower())
-    return [t.lstrip("0") or "0" if t.isdigit() else t for t in tokens]
+    out: List[str] = []
+    for t in _TOKEN_RE.findall(text.lower()):
+        if t.isdigit():
+            out.append(t.lstrip("0") or "0")
+        else:
+            out.append(_stem(t))
+    return out
+
+
+# Doc-specific acronym ↔ phrase synonyms. Tokens here are already
+# stemmed forms (e.g. "service" not "services"). Forward expansion
+# always: a query containing the acronym also matches the phrase.
+# Reverse expansion when the query contains every spelled-out word:
+# searching "mental health" also matches chunks tagged "(MH findings)".
+_TOKEN_SYNONYMS = {
+    "mh": ["mental", "health"],
+    "phc": ["primary", "health", "care"],
+    "ems": ["emergency", "medical", "service"],
+    "hrh": ["human", "resource", "health"],
+    "chw": ["community", "health", "worker"],
+    "tnc": ["trauma", "nurse", "coordinator"],
+    "fgd": ["focus", "group", "discussion"],
+    "po": ["participant", "observation"],
+}
+
+
+def _expand_synonyms(tokens: List[str]) -> List[str]:
+    expanded = list(tokens)
+    token_set = set(tokens)
+    for acro, words in _TOKEN_SYNONYMS.items():
+        if acro in token_set:
+            expanded.extend(words)
+        elif all(w in token_set for w in words):
+            expanded.append(acro)
+    return expanded
 
 
 _Q_LINE_BOOST = 3  # extra copies of Q-line tokens added to the BM25 corpus
@@ -497,6 +543,10 @@ def search(
         if allowed is not None and any(not t.isdigit() for t in q_tokens)
         else q_tokens
     )
+    # Acronym/phrase synonym expansion. "mental health" picks up chunks
+    # tagged "(MH findings)" and vice versa; the lexical-presence anchor
+    # downstream then keeps those chunks in the semantic ranking too.
+    bm25_query = _expand_synonyms(bm25_query)
     bm25_scores = bm25.get_scores(bm25_query)
 
     # Identifier queries: rank prefiltered chunks by BM25 alone (semantic is
@@ -581,6 +631,40 @@ def search(
 # Result rendering helpers
 # ---------------------------------------------------------------------------
 
+def _query_highlight_terms(query: str) -> set:
+    """Stemmed + synonym-expanded query tokens, for matching in rendered text."""
+    if not query.strip():
+        return set()
+    return set(_expand_synonyms(_tokenize(query)))
+
+
+def _word_query_form(word: str) -> str:
+    """Convert a raw word to the form it would have in the query token set."""
+    w = word.lower()
+    if w.isdigit():
+        return w.lstrip("0") or "0"
+    return _stem(w)
+
+
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _highlight(escaped_html: str, terms: set) -> str:
+    """Wrap query-matching words in <mark>. Operates on already-escaped HTML
+    so it never mangles tags. Matches whole words; folding stems and digit
+    leading zeros so "limitation" highlights "limitations" too."""
+    if not terms:
+        return escaped_html
+    def repl(m):
+        w = m.group(0)
+        return (
+            f'<mark class="search-hl">{w}</mark>'
+            if _word_query_form(w) in terms
+            else w
+        )
+    return _WORD_RE.sub(repl, escaped_html)
+
+
 def _split_qa(chunk: str) -> tuple[str, str]:
     """Split a stored chunk into (question, answer), with markers stripped."""
     lines = chunk.split("\n", 1)
@@ -598,12 +682,12 @@ def _md_preserve_breaks(text: str) -> str:
     return "\n\n".join(p.replace("\n", "  \n") for p in paragraphs)
 
 
-def _answer_html(a: str) -> str:
+def _answer_html(a: str, hl: set) -> str:
     """Convert a plain-text answer into HTML-safe paragraph + list markup.
 
     Lines tagged with the bullet sentinel become ``<li>`` items inside a
     single ``<ul>``; consecutive bullets stay grouped. Other lines render
-    as ``<p>`` paragraphs as before.
+    as ``<p>`` paragraphs as before. Query terms are wrapped in <mark>.
     """
     out: List[str] = []
     bullet_buf: List[str] = []
@@ -611,7 +695,9 @@ def _answer_html(a: str) -> str:
     def flush_bullets() -> None:
         if not bullet_buf:
             return
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullet_buf)
+        items = "".join(
+            f"<li>{_highlight(html.escape(b), hl)}</li>" for b in bullet_buf
+        )
         out.append(f"<ul class='answer-list'>{items}</ul>")
         bullet_buf.clear()
 
@@ -627,12 +713,12 @@ def _answer_html(a: str) -> str:
                 bullet_buf.append(stripped[len(_BULLET_PREFIX):].strip())
             else:
                 flush_bullets()
-                out.append(f"<p>{html.escape(stripped)}</p>")
+                out.append(f"<p>{_highlight(html.escape(stripped), hl)}</p>")
         flush_bullets()
     return "".join(out)
 
 
-def _render_best_match(chunk: str, page: Optional[int]) -> None:
+def _render_best_match(chunk: str, page: Optional[int], hl: set) -> None:
     """Large bordered card — the primary result, with bigger body text."""
     q, a = _split_qa(chunk)
     with st.container(border=True):
@@ -642,22 +728,22 @@ def _render_best_match(chunk: str, page: Optional[int]) -> None:
                 unsafe_allow_html=True,
             )
         st.markdown(
-            f'<div class="best-question">{html.escape(q)}</div>',
+            f'<div class="best-question">{_highlight(html.escape(q), hl)}</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
-            f'<div class="best-answer">{_answer_html(a)}</div>',
+            f'<div class="best-answer">{_answer_html(a, hl)}</div>',
             unsafe_allow_html=True,
         )
 
 
-def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
+def _render_secondary(chunk: str, rank: int, page: Optional[int], hl: set) -> None:
     """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
     suffix = f"  ·  Page {page}" if page is not None else ""
     with st.expander(f"**#{rank}** — {q}{suffix}", expanded=False):
         st.markdown(
-            f'<div class="best-answer">{_answer_html(a)}</div>',
+            f'<div class="best-answer">{_answer_html(a, hl)}</div>',
             unsafe_allow_html=True,
         )
 
@@ -774,6 +860,23 @@ st.markdown(
         text-transform: uppercase;
         letter-spacing: 0.08em;
         opacity: 0.7;
+    }
+
+    /* Search-term highlight — flashes bright on render, then settles to a
+       subtle tint so it draws the eye without staying loud. The animation
+       restarts on every search keystroke (Streamlit re-renders), so the
+       effect is inherently temporary: tied to the active query, not baked
+       into the doc. */
+    mark.search-hl {
+        background: rgba(255, 241, 118, 0.4);
+        color: inherit;
+        padding: 0.05em 0.2em;
+        border-radius: 3px;
+        animation: search-hl-flash 0.9s ease-out;
+    }
+    @keyframes search-hl-flash {
+        0%   { background: rgba(255, 213, 79, 0.95); }
+        100% { background: rgba(255, 241, 118, 0.4); }
     }
 
     /* Hide Streamlit's auto-generated anchor links on markdown headings */
@@ -978,15 +1081,16 @@ def _page_for(idx: int) -> Optional[int]:
 
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
+    hl_terms = _query_highlight_terms(query)
     result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
     if result_ids:
         st.markdown("##### Best match")
-        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
+        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]), hl_terms)
         if len(result_ids) > 1:
             st.markdown("")
             st.markdown("##### Other matches")
             for rank, idx in enumerate(result_ids[1:], start=2):
-                _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
+                _render_secondary(docs[idx], rank=rank, page=_page_for(idx), hl=hl_terms)
     else:
         st.caption("No matches.")
 else:
@@ -997,4 +1101,4 @@ else:
     )
     st.markdown("##### Browse all")
     for i, chunk in enumerate(docs, start=1):
-        _render_secondary(chunk, rank=i, page=_page_for(i - 1))
+        _render_secondary(chunk, rank=i, page=_page_for(i - 1), hl=set())
