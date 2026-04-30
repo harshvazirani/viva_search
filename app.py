@@ -385,14 +385,23 @@ def build_bm25(docs: List[str]) -> BM25Okapi:
     answer that happens to contain a section header like "Chapter 5 —
     Primary Health Care" can outscore the actual "Can you summarise
     Chapter 5?" question whose Q line has only one mention.
+
+    Also stashes per-doc Q-line token sets on the returned object for use
+    by the identifier prefilter — the user's intent for a query like
+    "Chapter 3" is to find chunks tagged with "Chapter 3" in the Q line,
+    not chunks that happen to mention "3" somewhere in their answer body.
     """
     corpus: List[List[str]] = []
+    q_line_tokens: List[set] = []
     for d in docs:
         full = _tokenize(d)
         q_line = d.split("\n", 1)[0]
         q_toks = _tokenize(q_line)
         corpus.append(full + q_toks * _Q_LINE_BOOST)
-    return BM25Okapi(corpus)
+        q_line_tokens.append(set(q_toks))
+    bm25 = BM25Okapi(corpus)
+    bm25.q_line_tokens = q_line_tokens  # type: ignore[attr-defined]
+    return bm25
 
 
 # Reciprocal Rank Fusion constant. 60 is the value from the original Cormack
@@ -433,15 +442,27 @@ def search(
     q_digits = [t for t in q_tokens if t.isdigit()]
     allowed: Optional[set[int]] = None
     if q_digits:
-        candidates = {
+        # Strict pass: require every digit in the chunk's Q line. The user's
+        # tags ("Chapter 3 summary", "Case 4, maturity") sit there, so this
+        # matches their mental model and excludes chunks that merely
+        # reference the identifier in passing.
+        q_line_strict = {
             i for i in range(n)
-            if all(d in bm25.doc_freqs[i] for d in q_digits)
+            if all(d in bm25.q_line_tokens[i] for d in q_digits)
         }
-        # Only apply the filter if it leaves a usable result set. A query
-        # with a digit that nothing in the corpus matches falls back to
-        # full hybrid search instead of returning nothing.
-        if candidates:
-            allowed = candidates
+        if q_line_strict:
+            allowed = q_line_strict
+        else:
+            # Loose fallback: digit just has to appear somewhere in the
+            # chunk. Avoids returning nothing when the identifier isn't
+            # tagged in any Q line (e.g. searching a year that only
+            # surfaces in answer bodies).
+            chunk_loose = {
+                i for i in range(n)
+                if all(d in bm25.doc_freqs[i] for d in q_digits)
+            }
+            if chunk_loose:
+                allowed = chunk_loose
 
     # When digits act as the prefilter, drop them from the BM25 query so the
     # score reflects the conceptual term only ("chapter", "case"). Otherwise
