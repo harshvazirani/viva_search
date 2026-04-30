@@ -515,10 +515,30 @@ def search(
             return identifier_top[:k]
 
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
-    _d1, full_ids = index.search(q_emb, pool)
+    # Larger semantic pool so the lexical-presence filter below has enough
+    # candidates left when the matching chunks are BM25-rare.
+    sem_pool = min(n, max(pool * 3, 60))
+    _d1, full_ids = index.search(q_emb, sem_pool)
     full_semantic_ranking = [int(i) for i in full_ids[0] if i >= 0]
-    _d2, q_ids = q_index.search(q_emb, pool)
+    _d2, q_ids = q_index.search(q_emb, sem_pool)
     q_semantic_ranking = [int(i) for i in q_ids[0] if i >= 0]
+
+    # Anchor semantic rankings to lexical presence. If any chunk lexically
+    # matches a query term, drop semantic candidates that don't — otherwise
+    # a query like "reflexivity" picks a conceptually-adjacent "coenrolment"
+    # chunk that doesn't even contain the word. When no chunk matches at
+    # all, keep the full semantic ranking so true paraphrase queries
+    # still work.
+    if any(s > 0 for s in bm25_scores):
+        full_semantic_ranking = [
+            i for i in full_semantic_ranking if bm25_scores[i] > 0
+        ][:pool]
+        q_semantic_ranking = [
+            i for i in q_semantic_ranking if bm25_scores[i] > 0
+        ][:pool]
+    else:
+        full_semantic_ranking = full_semantic_ranking[:pool]
+        q_semantic_ranking = q_semantic_ranking[:pool]
     # argsort descending; take only docs with positive score (a real lexical
     # hit). Zero-score docs would just be arbitrary tie-breaking noise.
     lexical_ranking = [
