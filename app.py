@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple
 import faiss
 import streamlit as st
 from docx import Document
+from rank_bm25 import BM25Okapi
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
@@ -361,17 +362,70 @@ def build_index(docs: List[str], model: SentenceTransformer) -> faiss.Index:
     return index
 
 
+# Tokenizer for BM25. Lowercases, splits on non-alphanumerics, and strips
+# leading zeros from pure-digit tokens so "Case 03" and "Case 4" share the
+# vocabulary "case"/"3"/"4" — letting the user search "Case 4" and hit text
+# written as "Case 04". Without this, embedding-only search fares poorly on
+# short identifier queries because numerals carry weak semantic signal.
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> List[str]:
+    tokens = _TOKEN_RE.findall(text.lower())
+    return [t.lstrip("0") or "0" if t.isdigit() else t for t in tokens]
+
+
+def build_bm25(docs: List[str]) -> BM25Okapi:
+    return BM25Okapi([_tokenize(d) for d in docs])
+
+
+# Reciprocal Rank Fusion constant. 60 is the value from the original Cormack
+# et al. RRF paper and the de-facto default; small enough that top ranks
+# dominate, large enough that a doc ranked highly by one retriever but
+# missed by the other still surfaces.
+_RRF_K = 60
+
+
 def search(
     query: str,
     docs: List[str],
     index: faiss.Index,
+    bm25: BM25Okapi,
     model: SentenceTransformer,
     k: int = TOP_K,
 ) -> List[int]:
-    """Return indices of the top-k matching docs, best first."""
+    """Hybrid search: fuse FAISS (semantic) and BM25 (lexical) with RRF.
+
+    Pure semantic search misses short identifier queries like "Case 4" —
+    embeddings dilute single-token signals across many "case"-mentioning
+    chunks. BM25 nails those; FAISS handles paraphrases. RRF combines them
+    without needing to calibrate score scales between the two retrievers.
+    """
+    n = len(docs)
+    if n == 0:
+        return []
+    pool = min(n, max(k * 3, 20))
+
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
-    _distances, ids = index.search(q_emb, min(k, len(docs)))
-    return [int(i) for i in ids[0] if i >= 0]
+    _distances, faiss_ids = index.search(q_emb, pool)
+    semantic_ranking = [int(i) for i in faiss_ids[0] if i >= 0]
+
+    bm25_scores = bm25.get_scores(_tokenize(query))
+    # argsort descending; take only docs with positive score (a real lexical
+    # hit). Zero-score docs would just be arbitrary tie-breaking noise.
+    lexical_ranking = [
+        int(i) for i in bm25_scores.argsort()[::-1]
+        if bm25_scores[i] > 0
+    ][:pool]
+
+    fused: dict[int, float] = {}
+    for rank, idx in enumerate(semantic_ranking):
+        fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
+    for rank, idx in enumerate(lexical_ranking):
+        fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
+
+    ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+    return [idx for idx, _ in ordered[:k]]
 
 
 # ---------------------------------------------------------------------------
@@ -703,6 +757,7 @@ if st.session_state.get("file_hash") != active_hash:
     model = load_model()
     with st.spinner(f"Indexing {len(docs)} Q&A chunks..."):
         index = build_index(docs, model)
+        bm25 = build_bm25(docs)
 
     # Only surface pages if the document actually has break info. A doc that
     # was never rendered tags every paragraph page 1 — showing "Page 1"
@@ -714,6 +769,7 @@ if st.session_state.get("file_hash") != active_hash:
     st.session_state.docs = docs
     st.session_state.pages = pages
     st.session_state.index = index
+    st.session_state.bm25 = bm25
     st.session_state.doc_info = {
         "name": active_name,
         "chunks": len(docs),
@@ -724,6 +780,7 @@ if st.session_state.get("file_hash") != active_hash:
 docs = st.session_state.docs
 pages = st.session_state.pages
 index = st.session_state.index
+bm25 = st.session_state.bm25
 has_pages = st.session_state.doc_info["has_pages"]
 model = load_model()
 
@@ -769,7 +826,7 @@ def _page_for(idx: int) -> Optional[int]:
 
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
-    result_ids = search(query, docs, index, model, k=top_k)
+    result_ids = search(query, docs, index, bm25, model, k=top_k)
     if result_ids:
         st.markdown("##### Best match")
         _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
