@@ -406,16 +406,43 @@ def search(
         return []
     pool = min(n, max(k * 3, 20))
 
-    q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
-    _distances, faiss_ids = index.search(q_emb, pool)
-    semantic_ranking = [int(i) for i in faiss_ids[0] if i >= 0]
+    # Identifier prefilter. Embeddings can't tell "Chapter 5" from "Chapter 10"
+    # — MiniLM treats the digit as low-information, so the actual Chapter-5
+    # Q&A can land at semantic rank ~100 while "Chapter 10" wins rank 1. RRF
+    # then averages BM25's correct top hit back down. When the query carries
+    # digit tokens (chapter/case numbers, percentages, years), restrict the
+    # candidate set to chunks that contain every digit. BM25's doc_freqs is
+    # already a per-doc token→count map, so this is a free O(n) lookup.
+    q_tokens = _tokenize(query)
+    q_digits = [t for t in q_tokens if t.isdigit()]
+    allowed: Optional[set[int]] = None
+    if q_digits:
+        candidates = {
+            i for i in range(n)
+            if all(d in bm25.doc_freqs[i] for d in q_digits)
+        }
+        # Only apply the filter if it leaves a usable result set. A query
+        # with a digit that nothing in the corpus matches falls back to
+        # full hybrid search instead of returning nothing.
+        if candidates:
+            allowed = candidates
 
-    bm25_scores = bm25.get_scores(_tokenize(query))
+    q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
+    # When prefiltering, search the whole index then drop non-allowed ids;
+    # asking FAISS for `n` results is cheap at this corpus size.
+    faiss_k = n if allowed is not None else pool
+    _distances, faiss_ids = index.search(q_emb, faiss_k)
+    semantic_ranking = [
+        int(i) for i in faiss_ids[0]
+        if i >= 0 and (allowed is None or int(i) in allowed)
+    ][:pool]
+
+    bm25_scores = bm25.get_scores(q_tokens)
     # argsort descending; take only docs with positive score (a real lexical
     # hit). Zero-score docs would just be arbitrary tie-breaking noise.
     lexical_ranking = [
         int(i) for i in bm25_scores.argsort()[::-1]
-        if bm25_scores[i] > 0
+        if bm25_scores[i] > 0 and (allowed is None or int(i) in allowed)
     ][:pool]
 
     fused: dict[int, float] = {}
