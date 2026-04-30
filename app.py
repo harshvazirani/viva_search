@@ -375,8 +375,24 @@ def _tokenize(text: str) -> List[str]:
     return [t.lstrip("0") or "0" if t.isdigit() else t for t in tokens]
 
 
+_Q_LINE_BOOST = 3  # extra copies of Q-line tokens added to the BM25 corpus
+
+
 def build_bm25(docs: List[str]) -> BM25Okapi:
-    return BM25Okapi([_tokenize(d) for d in docs])
+    """Index each chunk with its question line repeated, so Q-line matches
+    dominate answer-body coincidences. The user's search keywords live in
+    the Q line (often as parenthetical tags) — without this boost, a long
+    answer that happens to contain a section header like "Chapter 5 —
+    Primary Health Care" can outscore the actual "Can you summarise
+    Chapter 5?" question whose Q line has only one mention.
+    """
+    corpus: List[List[str]] = []
+    for d in docs:
+        full = _tokenize(d)
+        q_line = d.split("\n", 1)[0]
+        q_toks = _tokenize(q_line)
+        corpus.append(full + q_toks * _Q_LINE_BOOST)
+    return BM25Okapi(corpus)
 
 
 # Reciprocal Rank Fusion constant. 60 is the value from the original Cormack
@@ -427,22 +443,41 @@ def search(
         if candidates:
             allowed = candidates
 
-    q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
-    # When prefiltering, search the whole index then drop non-allowed ids;
-    # asking FAISS for `n` results is cheap at this corpus size.
-    faiss_k = n if allowed is not None else pool
-    _distances, faiss_ids = index.search(q_emb, faiss_k)
-    semantic_ranking = [
-        int(i) for i in faiss_ids[0]
-        if i >= 0 and (allowed is None or int(i) in allowed)
-    ][:pool]
+    # When digits act as the prefilter, drop them from the BM25 query so the
+    # score reflects the conceptual term only ("chapter", "case"). Otherwise
+    # short chunks heavy in digits ("3.5/5", "Case 05") win on length-
+    # normalized term frequency over the chunk that's actually about
+    # Chapter 5. If the query is digits only, keep them — there's nothing
+    # else to score on.
+    bm25_query = (
+        [t for t in q_tokens if not t.isdigit()]
+        if allowed is not None and any(not t.isdigit() for t in q_tokens)
+        else q_tokens
+    )
+    bm25_scores = bm25.get_scores(bm25_query)
 
-    bm25_scores = bm25.get_scores(q_tokens)
+    # Identifier queries: skip semantic, rank by BM25 alone. Once the
+    # prefilter has narrowed to chunks that contain the identifier, semantic
+    # similarity becomes net-noise — MiniLM happily ranks an unrelated Q
+    # whose answer body mentions "Chapter 5 — Primary Health Care" above
+    # the actual "Can you summarise Chapter 5?" question. RRF can't recover
+    # from that because the noise hits the top of one ranking. The user
+    # typed an explicit identifier; trust the lexical retriever.
+    if allowed is not None:
+        ranked = [
+            int(i) for i in bm25_scores.argsort()[::-1]
+            if int(i) in allowed and bm25_scores[i] > 0
+        ]
+        return ranked[:k]
+
+    q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
+    _distances, faiss_ids = index.search(q_emb, pool)
+    semantic_ranking = [int(i) for i in faiss_ids[0] if i >= 0]
     # argsort descending; take only docs with positive score (a real lexical
     # hit). Zero-score docs would just be arbitrary tie-breaking noise.
     lexical_ranking = [
         int(i) for i in bm25_scores.argsort()[::-1]
-        if bm25_scores[i] > 0 and (allowed is None or int(i) in allowed)
+        if bm25_scores[i] > 0
     ][:pool]
 
     fused: dict[int, float] = {}
