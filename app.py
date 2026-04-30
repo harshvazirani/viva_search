@@ -499,19 +499,20 @@ def search(
     )
     bm25_scores = bm25.get_scores(bm25_query)
 
-    # Identifier queries: skip semantic, rank by BM25 alone. Once the
-    # prefilter has narrowed to chunks that contain the identifier, semantic
-    # similarity becomes net-noise — MiniLM happily ranks an unrelated Q
-    # whose answer body mentions "Chapter 5 — Primary Health Care" above
-    # the actual "Can you summarise Chapter 5?" question. RRF can't recover
-    # from that because the noise hits the top of one ranking. The user
-    # typed an explicit identifier; trust the lexical retriever.
+    # Identifier queries: rank prefiltered chunks by BM25 alone (semantic is
+    # net-noise once the user has typed an explicit identifier — see
+    # comment on `allowed` above). The strict pass returns the right top
+    # hit; we then pad with full hybrid results so the user still sees
+    # related context as secondary matches. Without padding, "Chapter 4"
+    # would return only the one chunk whose Q line tags Chapter 4.
+    identifier_top: List[int] = []
     if allowed is not None:
-        ranked = [
+        identifier_top = [
             int(i) for i in bm25_scores.argsort()[::-1]
             if int(i) in allowed and bm25_scores[i] > 0
         ]
-        return ranked[:k]
+        if len(identifier_top) >= k:
+            return identifier_top[:k]
 
     q_emb = model.encode([query], convert_to_numpy=True).astype("float32")
     _d1, full_ids = index.search(q_emb, pool)
@@ -538,7 +539,22 @@ def search(
         fused[idx] = fused.get(idx, 0.0) + 1.0 / (_RRF_K + rank)
 
     ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
-    return [idx for idx, _ in ordered[:k]]
+    hybrid_ranking = [idx for idx, _ in ordered]
+
+    # Identifier-tagged chunks lead, then fill with hybrid results (deduped)
+    # so the user gets related context after the strict matches. For
+    # non-identifier queries, identifier_top is empty and this is just the
+    # hybrid ranking.
+    seen = set()
+    result: List[int] = []
+    for idx in identifier_top + hybrid_ranking:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        result.append(idx)
+        if len(result) >= k:
+            break
+    return result
 
 
 # ---------------------------------------------------------------------------
