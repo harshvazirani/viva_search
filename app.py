@@ -21,10 +21,12 @@ import faiss
 import streamlit as st
 from docx import Document
 from rank_bm25 import BM25Okapi
+from rapidfuzz import process as rf_process
 from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from sentence_transformers import SentenceTransformer
+from st_keyup import st_keyup
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +476,28 @@ def build_bm25(docs: List[str]) -> BM25Okapi:
     bm25.q_line_tokens = q_line_tokens  # type: ignore[attr-defined]
     bm25.chunk_tokens = chunk_token_lists  # type: ignore[attr-defined]
     bm25.q_line_token_lists = q_line_token_lists  # type: ignore[attr-defined]
+    vocab: set[str] = set()
+    for toks in chunk_token_lists:
+        vocab.update(toks)
+    bm25.vocab = vocab  # type: ignore[attr-defined]
     return bm25
+
+
+def _fuzzy_correct(tokens: List[str], vocab: set[str]) -> List[str]:
+    """Replace unknown tokens with the closest vocab token within edit-distance
+    bounds. Short tokens get a tighter cutoff so "cat" doesn't snap to "rat".
+    Known tokens, digits, and very short tokens pass through unchanged."""
+    out: List[str] = []
+    for t in tokens:
+        if len(t) < 4 or t.isdigit() or t in vocab:
+            out.append(t)
+            continue
+        # score_cutoff is rapidfuzz WRatio (0-100). 82 ≈ 1 typo on a 6-letter
+        # word; 88 for shorter tokens to avoid wild snaps.
+        cutoff = 88 if len(t) <= 5 else 82
+        match = rf_process.extractOne(t, vocab, score_cutoff=cutoff)
+        out.append(match[0] if match else t)
+    return out
 
 
 def _phrase_indices(token_seq: List[str], phrase: List[str]) -> bool:
@@ -524,6 +547,10 @@ def search(
     # candidate set to chunks that contain every digit. BM25's doc_freqs is
     # already a per-doc token→count map, so this is a free O(n) lookup.
     q_tokens = _tokenize(query)
+    # Typo tolerance: snap unknown tokens to the closest vocab match. Only
+    # affects tokens that aren't already in the corpus, so exact matches
+    # remain untouched and the user's literal spelling wins when it exists.
+    q_tokens = _fuzzy_correct(q_tokens, bm25.vocab)  # type: ignore[attr-defined]
     q_digits = [t for t in q_tokens if t.isdigit()]
     allowed: Optional[set[int]] = None
     if q_digits:
@@ -666,6 +693,20 @@ def search(
         fused[idx] = fused.get(idx, 0.0) + 0.05
     for idx in phrase_chunk_hits - phrase_qline_hits:
         fused[idx] = fused.get(idx, 0.0) + 0.02
+
+    # Verbatim-substring bonus: if the user's literal query (case-insensitive,
+    # whitespace-collapsed) appears in the chunk, give a strong push so exact
+    # matches outrank stemmed/semantic near-misses. Q-line hits get the
+    # heaviest boost since tags live there.
+    raw_query = " ".join(query.lower().split())
+    if len(raw_query) >= 3:
+        for i in range(n):
+            chunk = docs[i].lower()
+            q_line = chunk.split("\n", 1)[0]
+            if raw_query in q_line:
+                fused[i] = fused.get(i, 0.0) + 0.12
+            elif raw_query in chunk:
+                fused[i] = fused.get(i, 0.0) + 0.06
 
     ordered = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
     hybrid_ranking = [idx for idx, _ in ordered]
@@ -1091,17 +1132,21 @@ with sidebar_info.container():
     else:
         top_k = 1
 
-query = st.text_input(
+_MIN_LIVE_CHARS = 3
+query = st_keyup(
     "Search",
     placeholder="Type keywords: method choice, limitations, future work...",
+    debounce=180,
+    key="search_box",
     label_visibility="collapsed",
-)
+) or ""
 
 def _page_for(idx: int) -> Optional[int]:
     return pages[idx] if has_pages else None
 
 
-if query.strip():
+_q = query.strip()
+if _q and len(_q) >= _MIN_LIVE_CHARS:
     # Search mode — show best match prominently, others in expanders.
     result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
     if result_ids:
@@ -1114,6 +1159,8 @@ if query.strip():
                 _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
     else:
         st.caption("No matches.")
+elif _q:
+    st.caption(f"Keep typing — searching after {_MIN_LIVE_CHARS} characters.")
 else:
     # Browse mode — show all Q&A pairs as collapsed expanders.
     st.caption(

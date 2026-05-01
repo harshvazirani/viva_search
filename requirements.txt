@@ -4,3 +4,5 @@ faiss-cpu
 numpy
 python-docx
 rank-bm25
+rapidfuzz
+streamlit-keyup
