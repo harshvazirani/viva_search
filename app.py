@@ -874,10 +874,21 @@ st.markdown(
     [data-testid="stExpander"] {
         border-radius: 10px;
     }
+    [data-testid="stExpander"] summary,
+    [data-testid="stExpander"] summary *,
+    [data-testid="stExpander"] details > summary,
+    [data-testid="stExpander"] details > summary * {
+        font-size: 1.35rem !important;
+        font-weight: 600 !important;
+        line-height: 1.35 !important;
+        letter-spacing: -0.015em !important;
+    }
     [data-testid="stExpander"] summary {
-        padding-top: 0.55rem;
-        padding-bottom: 0.55rem;
-        font-size: 0.95rem;
+        padding-top: 0.7rem;
+        padding-bottom: 0.7rem;
+    }
+    [data-testid="stExpander"] summary p {
+        margin: 0;
     }
 
     /* Sidebar polish */
