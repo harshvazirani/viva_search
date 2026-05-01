@@ -848,8 +848,13 @@ st.markdown(
         margin-bottom: 0.85rem;
     }
 
-    /* Best-match answer body — this is the main size bump */
-    .best-answer {
+    /* Best-match answer body — this is the main size bump.
+       Selectors are scoped so they also win inside expanders, where
+       Streamlit otherwise drops the font size. */
+    .best-answer,
+    [data-testid="stExpander"] .best-answer,
+    [data-testid="stExpander"] .best-answer p,
+    [data-testid="stExpander"] .best-answer li {
         font-size: 1.15rem;
         line-height: 1.75;
     }
