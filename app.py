@@ -690,40 +690,6 @@ def search(
 # Result rendering helpers
 # ---------------------------------------------------------------------------
 
-def _query_highlight_terms(query: str) -> set:
-    """Stemmed + synonym-expanded query tokens, for matching in rendered text."""
-    if not query.strip():
-        return set()
-    return set(_expand_synonyms(_tokenize(query)))
-
-
-def _word_query_form(word: str) -> str:
-    """Convert a raw word to the form it would have in the query token set."""
-    w = word.lower()
-    if w.isdigit():
-        return w.lstrip("0") or "0"
-    return _stem(w)
-
-
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
-
-
-def _highlight(escaped_html: str, terms: set) -> str:
-    """Wrap query-matching words in <mark>. Operates on already-escaped HTML
-    so it never mangles tags. Matches whole words; folding stems and digit
-    leading zeros so "limitation" highlights "limitations" too."""
-    if not terms:
-        return escaped_html
-    def repl(m):
-        w = m.group(0)
-        return (
-            f'<mark class="search-hl">{w}</mark>'
-            if _word_query_form(w) in terms
-            else w
-        )
-    return _WORD_RE.sub(repl, escaped_html)
-
-
 def _split_qa(chunk: str) -> tuple[str, str]:
     """Split a stored chunk into (question, answer), with markers stripped."""
     lines = chunk.split("\n", 1)
@@ -741,12 +707,12 @@ def _md_preserve_breaks(text: str) -> str:
     return "\n\n".join(p.replace("\n", "  \n") for p in paragraphs)
 
 
-def _answer_html(a: str, hl: set) -> str:
+def _answer_html(a: str) -> str:
     """Convert a plain-text answer into HTML-safe paragraph + list markup.
 
     Lines tagged with the bullet sentinel become ``<li>`` items inside a
     single ``<ul>``; consecutive bullets stay grouped. Other lines render
-    as ``<p>`` paragraphs as before. Query terms are wrapped in <mark>.
+    as ``<p>`` paragraphs as before.
     """
     out: List[str] = []
     bullet_buf: List[str] = []
@@ -754,9 +720,7 @@ def _answer_html(a: str, hl: set) -> str:
     def flush_bullets() -> None:
         if not bullet_buf:
             return
-        items = "".join(
-            f"<li>{_highlight(html.escape(b), hl)}</li>" for b in bullet_buf
-        )
+        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullet_buf)
         out.append(f"<ul class='answer-list'>{items}</ul>")
         bullet_buf.clear()
 
@@ -772,12 +736,12 @@ def _answer_html(a: str, hl: set) -> str:
                 bullet_buf.append(stripped[len(_BULLET_PREFIX):].strip())
             else:
                 flush_bullets()
-                out.append(f"<p>{_highlight(html.escape(stripped), hl)}</p>")
+                out.append(f"<p>{html.escape(stripped)}</p>")
         flush_bullets()
     return "".join(out)
 
 
-def _render_best_match(chunk: str, page: Optional[int], hl: set) -> None:
+def _render_best_match(chunk: str, page: Optional[int]) -> None:
     """Large bordered card — the primary result, with bigger body text."""
     q, a = _split_qa(chunk)
     with st.container(border=True):
@@ -787,22 +751,22 @@ def _render_best_match(chunk: str, page: Optional[int], hl: set) -> None:
                 unsafe_allow_html=True,
             )
         st.markdown(
-            f'<div class="best-question">{_highlight(html.escape(q), hl)}</div>',
+            f'<div class="best-question">{html.escape(q)}</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
-            f'<div class="best-answer">{_answer_html(a, hl)}</div>',
+            f'<div class="best-answer">{_answer_html(a)}</div>',
             unsafe_allow_html=True,
         )
 
 
-def _render_secondary(chunk: str, rank: int, page: Optional[int], hl: set) -> None:
+def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
     """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
     suffix = f"  ·  Page {page}" if page is not None else ""
     with st.expander(f"**#{rank}** — {q}{suffix}", expanded=False):
         st.markdown(
-            f'<div class="best-answer">{_answer_html(a, hl)}</div>',
+            f'<div class="best-answer">{_answer_html(a)}</div>',
             unsafe_allow_html=True,
         )
 
@@ -919,24 +883,6 @@ st.markdown(
         text-transform: uppercase;
         letter-spacing: 0.08em;
         opacity: 0.7;
-    }
-
-    /* Search-term highlight — flashes bright on render, then fades fully
-       to transparent. The mark element stays in the DOM (good for screen
-       readers) but is visually gone after the animation completes, so the
-       highlight is truly temporary. Animation re-fires on every search
-       keystroke. */
-    mark.search-hl {
-        background: transparent;
-        color: inherit;
-        padding: 0.05em 0.2em;
-        border-radius: 3px;
-        animation: search-hl-flash 2.4s ease-out forwards;
-    }
-    @keyframes search-hl-flash {
-        0%   { background: rgba(255, 213, 79, 0.95); }
-        40%  { background: rgba(255, 213, 79, 0.85); }
-        100% { background: transparent; }
     }
 
     /* Hide Streamlit's auto-generated anchor links on markdown headings */
@@ -1141,16 +1087,15 @@ def _page_for(idx: int) -> Optional[int]:
 
 if query.strip():
     # Search mode — show best match prominently, others in expanders.
-    hl_terms = _query_highlight_terms(query)
     result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
     if result_ids:
         st.markdown("##### Best match")
-        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]), hl_terms)
+        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
         if len(result_ids) > 1:
             st.markdown("")
             st.markdown("##### Other matches")
             for rank, idx in enumerate(result_ids[1:], start=2):
-                _render_secondary(docs[idx], rank=rank, page=_page_for(idx), hl=hl_terms)
+                _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
     else:
         st.caption("No matches.")
 else:
@@ -1161,4 +1106,4 @@ else:
     )
     st.markdown("##### Browse all")
     for i, chunk in enumerate(docs, start=1):
-        _render_secondary(chunk, rank=i, page=_page_for(i - 1), hl=set())
+        _render_secondary(chunk, rank=i, page=_page_for(i - 1))
