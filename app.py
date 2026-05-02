@@ -90,6 +90,12 @@ _PAGE_MARKER = re.compile(r"⟪PAGE=(\d+)⟫")
 # search; the answer renderer turns runs of these into a real <ul>.
 _BULLET_PREFIX = "⟦•⟧ "
 
+# Bold sentinels — wrap bold runs during extraction so the renderer can
+# re-emit them as <strong>. Brackets are non-alphanumeric, so the BM25
+# tokenizer ignores them and they pass through normalization untouched.
+_BOLD_OPEN = "⟦B⟧"
+_BOLD_CLOSE = "⟦/B⟧"
+
 
 def _paragraph_page_breaks(element, use_rendered: bool) -> Tuple[int, int]:
     """Count page breaks in a paragraph, split by position relative to text.
@@ -144,6 +150,50 @@ def _is_list_paragraph(para: Paragraph) -> bool:
     return style == "List Paragraph"
 
 
+def _paragraph_text_with_bold(para: Paragraph) -> str:
+    """Paragraph text with bold runs wrapped in sentinels.
+
+    Walks each run's XML children directly so ``<w:br/>`` line breaks and
+    ``<w:tab/>`` survive — iterating ``para.runs`` and concatenating
+    ``run.text`` would silently drop those, which collapses Q/A pairs
+    that share a paragraph onto one line.
+    """
+    runs = list(para.runs)
+    if not any(r.bold for r in runs):
+        return para.text
+    parts: List[str] = []
+    for r in runs:
+        bold = bool(r.bold)
+        run_chars: List[str] = []
+        for child in r._element.iterchildren():
+            tag = child.tag
+            if tag == qn("w:t"):
+                run_chars.append(child.text or "")
+            elif tag == qn("w:tab"):
+                run_chars.append("\t")
+            elif tag in (qn("w:br"), qn("w:cr")):
+                run_chars.append("\n")
+        run_text = "".join(run_chars)
+        if not run_text:
+            continue
+        if bold and run_text.strip():
+            # Wrap each line of the run separately so a bold run that
+            # spans an internal <w:br/> doesn't end up with a sentinel
+            # straddling the newline. Pure-whitespace runs aren't wrapped.
+            wrapped: List[str] = []
+            for i, line in enumerate(run_text.split("\n")):
+                if i:
+                    wrapped.append("\n")
+                if line.strip():
+                    wrapped.append(f"{_BOLD_OPEN}{line}{_BOLD_CLOSE}")
+                else:
+                    wrapped.append(line)
+            parts.append("".join(wrapped))
+        else:
+            parts.append(run_text)
+    return "".join(parts)
+
+
 def _iter_paragraphs_in_order(doc):
     """Yield every paragraph in document order, flattening tables into cells."""
     for child in doc.element.body.iterchildren():
@@ -174,7 +224,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
     for para in _iter_paragraphs_in_order(doc):
         leading, trailing = _paragraph_page_breaks(para._element, use_rendered)
         current_page += leading
-        body = para.text
+        body = _paragraph_text_with_bold(para)
         if _is_list_paragraph(para) and body.strip():
             body = f"{_BULLET_PREFIX}{body.lstrip()}"
         lines.append(f"⟪PAGE={current_page}⟫{body}")
@@ -186,28 +236,37 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
 # Q/A extraction — robust to real-world messy formatting
 # ---------------------------------------------------------------------------
 
+# Optional leading bold sentinel — present when Word bolded the entire
+# "Q: ..." or "A: ..." line, which would otherwise prevent the boundary
+# regexes from matching the Q/A marker at line start.
+_BOLD_OPT = r"(?:⟦B⟧)?"
+
 # Question boundary: line start with Q:, Q -, Question:, or "1. " numbering.
 # The optional ⟪PAGE=N⟫ group lets the boundary survive after page tagging.
 _Q_BOUNDARY = re.compile(
-    r"(?:^|\n)(?:⟪PAGE=\d+⟫)?[ \t]*"
+    r"(?:^|\n)(?:⟪PAGE=\d+⟫)?[ \t]*" + _BOLD_OPT +
     r"(?:Question[ \t]*[:\-]?|Q[ \t]*[:\-]|\d+\.\s)",
     re.IGNORECASE,
 )
 
 # Answer marker: anchored to line start so "A:" inside prose can't split.
 _A_MARKER = re.compile(
-    r"(?m)^[ \t]*A(?:ns(?:wer)?)?[ \t]*[:\-]",
+    r"(?m)^[ \t]*" + _BOLD_OPT + r"A(?:ns(?:wer)?)?[ \t]*[:\-]",
     re.IGNORECASE,
 )
 
 # Leading prefix to strip from a captured question. Longer alternative first
-# so "Question:" isn't shortened to "uestion:" by a greedy "Q" match.
+# so "Question:" isn't shortened to "uestion:" by a greedy "Q" match. The
+# bold-open sentinel is captured (not consumed) so that a fully-bolded
+# "Q: ..." line keeps its opening ⟦B⟧ after the marker is stripped — the
+# matching ⟦/B⟧ later in the line stays balanced.
 _Q_PREFIX = re.compile(
-    r"^(?:Question[ \t]*[:\-\s]*|Q[ \t]*[:\-\s]*|\d+\.\s*)",
+    r"^(⟦B⟧)?"
+    r"(?:Question[ \t]*[:\-\s]*|Q[ \t]*[:\-\s]*|\d+\.\s*)",
     re.IGNORECASE,
 )
 _A_PREFIX = re.compile(
-    r"^A(?:ns(?:wer)?)?[ \t]*[:\-\s]*",
+    r"^(⟦B⟧)?A(?:ns(?:wer)?)?[ \t]*[:\-\s]*",
     re.IGNORECASE,
 )
 
@@ -274,8 +333,8 @@ def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
                 continue
             question, answer = lines[0], lines[1]
 
-        question = _Q_PREFIX.sub("", question, count=1).strip()
-        answer = _A_PREFIX.sub("", answer, count=1)
+        question = _Q_PREFIX.sub(r"\1", question, count=1).strip()
+        answer = _A_PREFIX.sub(r"\1", answer, count=1)
         answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
 
         if len(question) >= 3 and len(answer) >= 1:
@@ -748,6 +807,23 @@ def _md_preserve_breaks(text: str) -> str:
     return "\n\n".join(p.replace("\n", "  \n") for p in paragraphs)
 
 
+def _escape_with_bold(text: str) -> str:
+    """HTML-escape text, then convert bold sentinels to <strong> tags.
+    Bracket sentinels are non-ASCII, so html.escape passes them through
+    unchanged and the post-replacement is safe."""
+    return (
+        html.escape(text)
+        .replace(_BOLD_OPEN, "<strong>")
+        .replace(_BOLD_CLOSE, "</strong>")
+    )
+
+
+def _bold_to_md(text: str) -> str:
+    """Convert bold sentinels to markdown ** markers (used for the
+    expander summary label, which Streamlit renders as markdown)."""
+    return text.replace(_BOLD_OPEN, "**").replace(_BOLD_CLOSE, "**")
+
+
 def _answer_html(a: str) -> str:
     """Convert a plain-text answer into HTML-safe paragraph + list markup.
 
@@ -761,7 +837,7 @@ def _answer_html(a: str) -> str:
     def flush_bullets() -> None:
         if not bullet_buf:
             return
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullet_buf)
+        items = "".join(f"<li>{_escape_with_bold(b)}</li>" for b in bullet_buf)
         out.append(f"<ul class='answer-list'>{items}</ul>")
         bullet_buf.clear()
 
@@ -777,7 +853,7 @@ def _answer_html(a: str) -> str:
                 bullet_buf.append(stripped[len(_BULLET_PREFIX):].strip())
             else:
                 flush_bullets()
-                out.append(f"<p>{html.escape(stripped)}</p>")
+                out.append(f"<p>{_escape_with_bold(stripped)}</p>")
         flush_bullets()
     return "".join(out)
 
@@ -792,7 +868,7 @@ def _render_best_match(chunk: str, page: Optional[int]) -> None:
                 unsafe_allow_html=True,
             )
         st.markdown(
-            f'<div class="best-question">{html.escape(q)}</div>',
+            f'<div class="best-question">{_escape_with_bold(q)}</div>',
             unsafe_allow_html=True,
         )
         st.markdown(
@@ -805,7 +881,8 @@ def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
     """Collapsed expander — matches best-match body size when opened."""
     q, a = _split_qa(chunk)
     suffix = f"  ·  Page {page}" if page is not None else ""
-    with st.expander(f"**#{rank}** — {q}{suffix}", expanded=False):
+    q_label = _bold_to_md(q)
+    with st.expander(f"**#{rank}** — {q_label}{suffix}", expanded=False):
         st.markdown(
             f'<div class="best-answer">{_answer_html(a)}</div>',
             unsafe_allow_html=True,
@@ -904,6 +981,14 @@ st.markdown(
     }
     .best-answer p:last-child {
         margin-bottom: 0;
+    }
+
+    /* Bold from the source .docx — push to 800 so the contrast reads
+       even inside the question heading, which is already weight 600. */
+    .best-answer strong,
+    .best-question strong,
+    [data-testid="stExpander"] .best-answer strong {
+        font-weight: 800;
     }
 
     /* Bordered containers — softer corners and a bit more breathing room */
