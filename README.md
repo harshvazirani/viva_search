@@ -1,6 +1,6 @@
-# Viva Quick Search
+# Notes Lookup
 
-Minimal local semantic search for PhD viva Q&A lookup. Upload a `.docx` Q&A document, type 2–5 keywords, and get the best-matching Q&A block back instantly. No chat, no LLM generation, no persistence — pure retrieval over a FAISS index.
+Minimal local semantic search over a personal Q&A notes file. Upload a `.docx` of Q&A-formatted notes, type 2–5 keywords, and get the best-matching block back instantly. No chat, no LLM generation, no persistence — pure retrieval over a FAISS index.
 
 ## Project layout
 
@@ -44,8 +44,8 @@ The app opens at `http://localhost:8501`. The first launch downloads the `all-Mi
 ## Run with Docker
 
 ```bash
-docker build -t viva-search .
-docker run --rm -p 8501:8501 viva-search
+docker build -t notes-lookup .
+docker run --rm -p 8501:8501 notes-lookup
 ```
 
 Open `http://localhost:8501` and upload your `.docx` file.

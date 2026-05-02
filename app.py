@@ -1,4 +1,4 @@
-"""Viva Quick Search — local semantic search over an uploaded Q&A .docx file.
+"""Notes Lookup — local semantic search over an uploaded Q&A .docx file.
 
 Upload a Q&A document, type 2–5 keywords, get the best-matching Q&A block.
 No LLM, no chat — pure retrieval with sentence-transformers embeddings and a
@@ -816,7 +816,7 @@ def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="Viva Quick Search", layout="centered")
+st.set_page_config(page_title="Notes Lookup", layout="centered")
 
 # Custom styling — typography, spacing, and best-match emphasis.
 st.markdown(
@@ -988,7 +988,7 @@ with st.sidebar:
         "this session."
     )
 
-st.title("Viva Quick Search")
+st.title("Notes Lookup")
 
 # Resolve the active file:
 #   - a fresh upload always wins;
