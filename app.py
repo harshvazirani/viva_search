@@ -983,10 +983,47 @@ with st.sidebar:
         cached_on_disk = None
 
     st.markdown("---")
+    st.markdown("### Display")
+    font_size = st.slider(
+        "Font size",
+        min_value=0.85,
+        max_value=1.6,
+        value=1.15,
+        step=0.05,
+        format="%.2fx",
+        key="font_size",
+        help="Scales the question and answer body across all results.",
+    )
+
+    st.markdown("---")
     st.caption(
         "Local semantic search. No LLM, no chat — your document stays in "
         "this session."
     )
+
+# Apply user-selected font size as a CSS override. Question scales at a
+# fixed ratio above the body so the heading hierarchy stays intact.
+_q_size = font_size * (1.35 / 1.15)
+st.markdown(
+    f"""
+    <style>
+    .best-answer,
+    [data-testid="stExpander"] .best-answer,
+    [data-testid="stExpander"] .best-answer p,
+    [data-testid="stExpander"] .best-answer li {{
+        font-size: {font_size:.3f}rem !important;
+    }}
+    .best-question,
+    [data-testid="stExpander"] summary,
+    [data-testid="stExpander"] summary *,
+    [data-testid="stExpander"] details > summary,
+    [data-testid="stExpander"] details > summary * {{
+        font-size: {_q_size:.3f}rem !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("Notes Lookup")
 
