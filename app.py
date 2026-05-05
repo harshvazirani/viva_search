@@ -344,6 +344,27 @@ def build_chunks(text: str) -> Tuple[List[str], List[int]]:
     return chunks, pages
 
 
+def build_next_question_index(docs: List[str]) -> List[int]:
+    """Precompute, for each chunk, the index of the next chunk in document
+    order whose Q line is different (``-1`` if none exists).
+
+    Long Q/A blocks are split into sub-chunks that share the same Q header,
+    so the "next question" link must skip them. Doing that scan on every
+    render walks the chunk list and re-runs the regex-heavy ``_split_qa``
+    each time — slow on large docs, especially with chained next-clicks.
+    A backward sweep computes every entry in one O(n) pass; the UI then
+    just does ``next_idx[i]``.
+    """
+    n = len(docs)
+    if n == 0:
+        return []
+    qs = [_split_qa(d)[0] for d in docs]
+    next_idx = [-1] * n
+    for i in range(n - 2, -1, -1):
+        next_idx[i] = i + 1 if qs[i + 1] != qs[i] else next_idx[i + 1]
+    return next_idx
+
+
 # ---------------------------------------------------------------------------
 # Model + index
 # ---------------------------------------------------------------------------
@@ -782,33 +803,103 @@ def _answer_html(a: str) -> str:
     return "".join(out)
 
 
-def _render_best_match(chunk: str, page: Optional[int]) -> None:
+def _next_question_idx(idx: int, next_q_lookup: List[int]) -> Optional[int]:
+    """O(1) lookup into the precomputed next-question table built at index
+    time by ``build_next_question_index``. ``-1`` means no next question."""
+    if idx < 0 or idx >= len(next_q_lookup):
+        return None
+    j = next_q_lookup[idx]
+    return j if j >= 0 else None
+
+
+def _render_qa_body(chunk: str, page: Optional[int]) -> None:
+    """Render the question + answer in best-match typography (no wrapper)."""
+    q, a = _split_qa(chunk)
+    if page is not None:
+        st.markdown(
+            f'<div class="page-badge">Page {page}</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f'<div class="best-question">{html.escape(q)}</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div class="best-answer">{_answer_html(a)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_next_link(
+    idx: int,
+    docs: List[str],
+    next_q_lookup: List[int],
+    page_for,
+    key_prefix: str,
+) -> None:
+    """Show a 'Next question' link. When clicked, render the next Q/A
+    inline beneath, with its own next-question link so the user can chain.
+    """
+    nxt = _next_question_idx(idx, next_q_lookup)
+    if nxt is None:
+        return
+    state_key = f"_next_open::{key_prefix}"
+    btn_key = f"_next_btn::{key_prefix}"
+    if not st.session_state.get(state_key):
+        if st.button(
+            "→ Next question",
+            key=btn_key,
+            type="tertiary",
+        ):
+            st.session_state[state_key] = True
+            st.rerun()
+        return
+    st.markdown(
+        '<hr class="next-question-divider"/>',
+        unsafe_allow_html=True,
+    )
+    _render_qa_body(docs[nxt], page_for(nxt))
+    _render_next_link(
+        nxt, docs, next_q_lookup, page_for,
+        key_prefix=f"{key_prefix}::{nxt}",
+    )
+
+
+def _render_best_match(
+    idx: int,
+    docs: List[str],
+    next_q_lookup: List[int],
+    page_for,
+) -> None:
     """Large bordered card — the primary result, with bigger body text."""
-    q, a = _split_qa(chunk)
     with st.container(border=True):
-        if page is not None:
-            st.markdown(
-                f'<div class="page-badge">Page {page}</div>',
-                unsafe_allow_html=True,
-            )
-        st.markdown(
-            f'<div class="best-question">{html.escape(q)}</div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f'<div class="best-answer">{_answer_html(a)}</div>',
-            unsafe_allow_html=True,
+        _render_qa_body(docs[idx], page_for(idx))
+        _render_next_link(
+            idx, docs, next_q_lookup, page_for,
+            key_prefix=f"best::{idx}",
         )
 
 
-def _render_secondary(chunk: str, rank: int, page: Optional[int]) -> None:
+def _render_secondary(
+    idx: int,
+    rank: int,
+    docs: List[str],
+    next_q_lookup: List[int],
+    page_for,
+) -> None:
     """Collapsed expander — matches best-match body size when opened."""
+    chunk = docs[idx]
     q, a = _split_qa(chunk)
+    page = page_for(idx)
     suffix = f"  ·  Page {page}" if page is not None else ""
     with st.expander(f"**#{rank}** — {q}{suffix}", expanded=False):
         st.markdown(
             f'<div class="best-answer">{_answer_html(a)}</div>',
             unsafe_allow_html=True,
+        )
+        _render_next_link(
+            idx, docs, next_q_lookup, page_for,
+            key_prefix=f"sec::{idx}",
         )
 
 
@@ -940,6 +1031,27 @@ st.markdown(
         text-transform: uppercase;
         letter-spacing: 0.08em;
         opacity: 0.7;
+    }
+
+    /* "Next question" link — soft divider between an opened Q/A and the
+       next one revealed by the link. */
+    hr.next-question-divider {
+        border: none;
+        border-top: 1px dashed rgba(127, 127, 127, 0.35);
+        margin: 1.5rem 0 1.25rem 0;
+    }
+
+    /* Style tertiary buttons used as "Next question" links — make them
+       feel like a hyperlink rather than a heavyweight button. */
+    [data-testid="stBaseButton-tertiary"] {
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+        font-weight: 500 !important;
+        color: #1f6feb !important;
+    }
+    [data-testid="stBaseButton-tertiary"]:hover {
+        text-decoration: underline !important;
+        color: #1158c7 !important;
     }
 
     /* Hide Streamlit's auto-generated anchor links on markdown headings */
@@ -1111,6 +1223,7 @@ if st.session_state.get("file_hash") != active_hash:
         index = build_index(docs, model)
         q_index = build_q_index(docs, model)
         bm25 = build_bm25(docs)
+        next_q_idx = build_next_question_index(docs)
 
     # Only surface pages if the document actually has break info. A doc that
     # was never rendered tags every paragraph page 1 — showing "Page 1"
@@ -1124,6 +1237,7 @@ if st.session_state.get("file_hash") != active_hash:
     st.session_state.index = index
     st.session_state.q_index = q_index
     st.session_state.bm25 = bm25
+    st.session_state.next_q_idx = next_q_idx
     st.session_state.doc_info = {
         "name": active_name,
         "chunks": len(docs),
@@ -1136,6 +1250,7 @@ pages = st.session_state.pages
 index = st.session_state.index
 q_index = st.session_state.q_index
 bm25 = st.session_state.bm25
+next_q_idx = st.session_state.next_q_idx
 has_pages = st.session_state.doc_info["has_pages"]
 model = load_model()
 
@@ -1188,12 +1303,15 @@ if _q and len(_q) >= _MIN_LIVE_CHARS:
     result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
     if result_ids:
         st.markdown("##### Best match")
-        _render_best_match(docs[result_ids[0]], _page_for(result_ids[0]))
+        _render_best_match(result_ids[0], docs, next_q_idx, _page_for)
         if len(result_ids) > 1:
             st.markdown("")
             st.markdown("##### Other matches")
             for rank, idx in enumerate(result_ids[1:], start=2):
-                _render_secondary(docs[idx], rank=rank, page=_page_for(idx))
+                _render_secondary(
+                    idx, rank=rank, docs=docs,
+                    next_q_lookup=next_q_idx, page_for=_page_for,
+                )
     else:
         st.caption("No matches.")
 elif _q:
@@ -1205,5 +1323,8 @@ else:
         "or browse all pairs below."
     )
     st.markdown("##### Browse all")
-    for i, chunk in enumerate(docs, start=1):
-        _render_secondary(chunk, rank=i, page=_page_for(i - 1))
+    for i, _ in enumerate(docs, start=1):
+        _render_secondary(
+            i - 1, rank=i, docs=docs,
+            next_q_lookup=next_q_idx, page_for=_page_for,
+        )

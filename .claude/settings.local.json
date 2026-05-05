@@ -12,7 +12,11 @@
       "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:8501/)",
       "Read(//tmp/**)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python *)",
+      "Bash(streamlit run *)",
+      "Bash(/Users/harshvazirani/puchu-project/.venv/bin/streamlit run *)",
+      "Bash(/Users/harshvazirani/puchu-project/.venv/bin/python3 *)"
     ]
   }
 }
