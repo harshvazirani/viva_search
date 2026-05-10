@@ -289,14 +289,39 @@ def extract_qa_pairs(text: str) -> List[Tuple[str, int]]:
 # ---------------------------------------------------------------------------
 
 def _split_sentences(body: str) -> List[str]:
-    """Paragraph-then-sentence split; preserves paragraph boundaries."""
+    """Paragraph-then-sentence split; preserves paragraph boundaries.
+
+    Bullet lines (those starting with ``_BULLET_PREFIX``) are kept as their
+    own segments so the leading sentinel survives chunk reassembly — without
+    this, the sentence-flattening below would move bullet markers off line
+    starts and the renderer would print the raw sentinels mid-paragraph.
+    """
     segments: List[str] = []
     for para in re.split(r"\n\s*\n", body):
         para = para.strip()
         if not para:
             continue
-        para_one_line = re.sub(r"\s*\n\s*", " ", para)
-        segments.extend(s for s in re.split(r"(?<=[.!?])\s+", para_one_line) if s)
+        prose_buf: List[str] = []
+
+        def flush_prose() -> None:
+            if not prose_buf:
+                return
+            joined = re.sub(r"\s*\n\s*", " ", " ".join(prose_buf))
+            segments.extend(
+                s for s in re.split(r"(?<=[.!?])\s+", joined) if s
+            )
+            prose_buf.clear()
+
+        for line in para.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(_BULLET_PREFIX):
+                flush_prose()
+                segments.append(stripped)
+            else:
+                prose_buf.append(stripped)
+        flush_prose()
     return segments
 
 
@@ -318,17 +343,32 @@ def _split_long_chunk(chunk: str, max_words: int = MAX_WORDS_PER_CHUNK) -> List[
     parts: List[str] = []
     buf: List[str] = []
     buf_words = 0
+
+    def join_buf() -> str:
+        # Bullet segments need their leading sentinel at the start of a line
+        # for the renderer to detect them; prose sentences join with a space.
+        out: List[str] = []
+        for i, seg in enumerate(buf):
+            if i > 0:
+                touches_bullet = (
+                    seg.startswith(_BULLET_PREFIX)
+                    or buf[i - 1].startswith(_BULLET_PREFIX)
+                )
+                out.append("\n" if touches_bullet else " ")
+            out.append(seg)
+        return "".join(out)
+
     for seg in segments:
         seg_words = len(seg.split())
         if buf and buf_words + seg_words > max_words:
-            body = " ".join(buf)
+            body = join_buf()
             parts.append(f"{q_header}\n{body}".strip() if q_header else body)
             buf, buf_words = [seg], seg_words
         else:
             buf.append(seg)
             buf_words += seg_words
     if buf:
-        body = " ".join(buf)
+        body = join_buf()
         parts.append(f"{q_header}\n{body}".strip() if q_header else body)
     return parts or [chunk]
 
