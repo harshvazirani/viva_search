@@ -72,7 +72,7 @@ MODEL_NAME = "all-MiniLM-L6-v2"
 TOP_K = 6
 DEFAULT_TOP_K = 6
 MAX_TOP_K = 20
-MAX_WORDS_PER_CHUNK = 500
+MAX_WORDS_PER_CHUNK = 180  # ≈ MiniLM's 256-token input window
 
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1240,7 @@ if active_bytes is None:
         "- Include synonyms in parentheses after the question to broaden "
         "keyword matching, e.g. `Q: Why did you choose method X? "
         "(method choice, approach selection)`.\n"
-        "- Very long answers (>500 words) are split automatically; the question "
+        "- Long answers are split automatically; the question "
         "is repeated on each sub-chunk so context is preserved."
     )
 
