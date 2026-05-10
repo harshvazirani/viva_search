@@ -373,15 +373,31 @@ def _split_long_chunk(chunk: str, max_words: int = MAX_WORDS_PER_CHUNK) -> List[
     return parts or [chunk]
 
 
-def build_chunks(text: str) -> Tuple[List[str], List[int]]:
-    """Return parallel lists: Q&A chunks and the page each one starts on."""
-    chunks: List[str] = []
-    pages: List[int] = []
+def build_chunks(
+    text: str,
+) -> Tuple[List[str], List[str], List[int], List[int]]:
+    """Build search chunks (sub-chunks for tighter embeddings) and display
+    chunks (one per Q&A for rendering).
+
+    Long answers are split into N sub-chunks so each one fits MiniLM's
+    effective window — that's good for retrieval but bad for display, since
+    multiple sub-chunks of the same Q&A would otherwise show up as separate
+    duplicate-question results. Returning both lists, plus a sub→display
+    index map, lets search operate on sub-chunks while the UI shows one
+    entry per Q&A.
+    """
+    search_chunks: List[str] = []
+    display_chunks: List[str] = []
+    display_pages: List[int] = []
+    sub_to_display: List[int] = []
     for block, page in extract_qa_pairs(text):
+        d_idx = len(display_chunks)
+        display_chunks.append(block)
+        display_pages.append(page)
         for sub in _split_long_chunk(block):
-            chunks.append(sub)
-            pages.append(page)
-    return chunks, pages
+            search_chunks.append(sub)
+            sub_to_display.append(d_idx)
+    return search_chunks, display_chunks, display_pages, sub_to_display
 
 
 def build_next_question_index(docs: List[str]) -> List[int]:
@@ -1250,7 +1266,7 @@ if st.session_state.get("file_hash") != active_hash:
         st.error(f"Failed to parse .docx file: {e}")
         st.stop()
 
-    docs, pages = build_chunks(raw_text)
+    search_docs, docs, pages, sub_to_display = build_chunks(raw_text)
     if not docs:
         st.warning(
             "No Q&A pairs detected. Make sure the document uses `Q:` and `A:` "
@@ -1259,10 +1275,10 @@ if st.session_state.get("file_hash") != active_hash:
         st.stop()
 
     model = load_model()
-    with st.spinner(f"Indexing {len(docs)} Q&A chunks..."):
-        index = build_index(docs, model)
-        q_index = build_q_index(docs, model)
-        bm25 = build_bm25(docs)
+    with st.spinner(f"Indexing {len(docs)} Q&A pairs..."):
+        index = build_index(search_docs, model)
+        q_index = build_q_index(search_docs, model)
+        bm25 = build_bm25(search_docs)
         next_q_idx = build_next_question_index(docs)
 
     # Only surface pages if the document actually has break info. A doc that
@@ -1273,6 +1289,8 @@ if st.session_state.get("file_hash") != active_hash:
 
     st.session_state.file_hash = active_hash
     st.session_state.docs = docs
+    st.session_state.search_docs = search_docs
+    st.session_state.sub_to_display = sub_to_display
     st.session_state.pages = pages
     st.session_state.index = index
     st.session_state.q_index = q_index
@@ -1286,6 +1304,8 @@ if st.session_state.get("file_hash") != active_hash:
     }
 
 docs = st.session_state.docs
+search_docs = st.session_state.search_docs
+sub_to_display = st.session_state.sub_to_display
 pages = st.session_state.pages
 index = st.session_state.index
 q_index = st.session_state.q_index
@@ -1340,7 +1360,23 @@ def _page_for(idx: int) -> Optional[int]:
 _q = query.strip()
 if _q and len(_q) >= _MIN_LIVE_CHARS:
     # Search mode — show best match prominently, others in expanders.
-    result_ids = search(query, docs, index, q_index, bm25, model, k=top_k)
+    # Search runs over sub-chunks for tighter embeddings; over-fetch and
+    # collapse to one entry per display chunk so a long Q&A whose two
+    # sub-chunks both rank highly doesn't show up as two duplicate results.
+    sub_ids = search(
+        query, search_docs, index, q_index, bm25, model,
+        k=min(len(search_docs), max(top_k * 3, top_k)),
+    )
+    seen_display: set[int] = set()
+    result_ids: List[int] = []
+    for sid in sub_ids:
+        did = sub_to_display[sid]
+        if did in seen_display:
+            continue
+        seen_display.add(did)
+        result_ids.append(did)
+        if len(result_ids) >= top_k:
+            break
     if result_ids:
         st.markdown("##### Best match")
         _render_best_match(result_ids[0], docs, next_q_idx, _page_for)
