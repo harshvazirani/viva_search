@@ -972,12 +972,18 @@ st.markdown(
     /* Hide Streamlit header and toolbar */
     header[data-testid="stHeader"] {
         display: none !important;
+        height: 0 !important;
+    }
+    [data-testid="stMain"] {
+        padding-top: 0 !important;
+    }
+    .block-container {
+        padding-top: 1rem !important;
     }
 
     /* Content container — narrower for prose readability */
     section.main > div.block-container {
         max-width: 820px;
-        padding-top: 0rem;
         padding-bottom: 4rem;
     }
 
