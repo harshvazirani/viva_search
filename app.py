@@ -969,19 +969,12 @@ st.set_page_config(page_title="Notes Lookup", layout="centered")
 st.markdown(
     """
     <style>
-    /* Hide Streamlit toolbar but keep sidebar toggle */
-    header[data-testid="stHeader"] {
-        height: auto !important;
-        background: transparent !important;
-    }
-    [data-testid="stToolbar"] {
-        display: none !important;
-    }
+    /* Reduce top spacing */
     [data-testid="stMain"] {
         padding-top: 0 !important;
     }
     .block-container {
-        padding-top: 1rem !important;
+        padding-top: 2rem !important;
     }
 
     /* Content container — narrower for prose readability */
