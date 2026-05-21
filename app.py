@@ -1425,7 +1425,7 @@ components.html("""
     var btn = doc.createElement('div');
     btn.id = 'go-to-top-btn';
     btn.innerText = '↑';
-    btn.style.cssText = 'position:fixed;bottom:2rem;right:6rem;z-index:999999;background:#4a90d9;color:white;border-radius:50%;width:64px;height:64px;font-size:2.1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:opacity 0.3s;';
+    btn.style.cssText = 'position:fixed;bottom:2rem;right:14rem;z-index:999999;background:rgba(74,144,217,0.4);color:white;border-radius:50%;width:44px;height:44px;font-size:1.3rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(0,0,0,0.2);transition:opacity 0.3s;';
 
     doc.body.appendChild(btn);
 
@@ -1433,10 +1433,20 @@ components.html("""
         main.scrollTo({top: 0});
     });
 
-    main.addEventListener('scroll', function() {
-        btn.style.opacity = main.scrollTop > 300 ? '1' : '0';
-        btn.style.pointerEvents = main.scrollTop > 300 ? 'auto' : 'none';
-    });
+    var hideTimer;
+    function showBtn() {
+        if (main.scrollTop > 300) {
+            btn.style.opacity = '1';
+            btn.style.pointerEvents = 'auto';
+        }
+        clearTimeout(hideTimer);
+        hideTimer = setTimeout(function() {
+            btn.style.opacity = '0';
+            btn.style.pointerEvents = 'none';
+        }, 1500);
+    }
+
+    doc.addEventListener('mousemove', showBtn);
     btn.style.opacity = '0';
     btn.style.pointerEvents = 'none';
 })();
