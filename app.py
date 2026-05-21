@@ -969,10 +969,15 @@ st.set_page_config(page_title="Notes Lookup", layout="centered")
 st.markdown(
     """
     <style>
-    /* Content container — narrower for prose readability, more top padding */
+    /* Hide Streamlit header and toolbar */
+    header[data-testid="stHeader"] {
+        display: none !important;
+    }
+
+    /* Content container — narrower for prose readability */
     section.main > div.block-container {
         max-width: 820px;
-        padding-top: 2.5rem;
+        padding-top: 0rem;
         padding-bottom: 4rem;
     }
 
@@ -1193,8 +1198,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("Notes Lookup")
-
 # Resolve the active file:
 #   - a fresh upload always wins;
 #   - otherwise use the disk cache only if the user has opted in.
@@ -1404,3 +1407,36 @@ else:
             i - 1, rank=i, docs=docs,
             next_q_lookup=next_q_idx, page_for=_page_for,
         )
+
+import streamlit.components.v1 as components
+
+components.html("""
+<script>
+(function() {
+    var doc = window.parent.document;
+    var old = doc.getElementById('go-to-top-btn');
+    if (old) old.remove();
+
+    var main = doc.querySelector('[data-testid="stMain"]');
+    if (!main) return;
+
+    var btn = doc.createElement('div');
+    btn.id = 'go-to-top-btn';
+    btn.innerText = '↑';
+    btn.style.cssText = 'position:fixed;bottom:2rem;right:2rem;z-index:999999;background:#4a90d9;color:white;border-radius:50%;width:48px;height:48px;font-size:1.5rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:opacity 0.3s;';
+
+    doc.body.appendChild(btn);
+
+    btn.addEventListener('click', function() {
+        main.scrollTo({top: 0, behavior: 'smooth'});
+    });
+
+    main.addEventListener('scroll', function() {
+        btn.style.opacity = main.scrollTop > 300 ? '1' : '0';
+        btn.style.pointerEvents = main.scrollTop > 300 ? 'auto' : 'none';
+    });
+    btn.style.opacity = '0';
+    btn.style.pointerEvents = 'none';
+})();
+</script>
+""", height=0)
