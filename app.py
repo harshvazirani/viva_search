@@ -1423,7 +1423,7 @@ st.iframe(src="""
     var btn = doc.createElement('div');
     btn.id = 'go-to-top-btn';
     btn.innerText = '↑';
-    btn.style.cssText = 'position:fixed;top:50%;right:7rem;transform:translateY(-50%);z-index:999999;background:rgba(74,144,217,0.4);color:white;border-radius:50%;width:44px;height:44px;font-size:1.3rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(0,0,0,0.2);transition:opacity 0.3s;';
+    btn.style.cssText = 'position:fixed;top:50%;right:1rem;transform:translateY(-50%);z-index:999999;background:rgba(74,144,217,0.4);color:white;border-radius:50%;width:44px;height:44px;font-size:1.3rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(0,0,0,0.2);transition:opacity 0.3s;';
 
     doc.body.appendChild(btn);
 
