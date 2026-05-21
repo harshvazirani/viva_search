@@ -1410,9 +1410,7 @@ else:
             next_q_lookup=next_q_idx, page_for=_page_for,
         )
 
-import streamlit.components.v1 as components
-
-components.html("""
+st.iframe(src="""
 <script>
 (function() {
     var doc = window.parent.document;
@@ -1451,4 +1449,4 @@ components.html("""
     btn.style.pointerEvents = 'none';
 })();
 </script>
-""", height=0)
+""", height=1)
