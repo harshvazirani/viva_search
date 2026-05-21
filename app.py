@@ -1425,12 +1425,12 @@ components.html("""
     var btn = doc.createElement('div');
     btn.id = 'go-to-top-btn';
     btn.innerText = '↑';
-    btn.style.cssText = 'position:fixed;bottom:2rem;right:2rem;z-index:999999;background:#4a90d9;color:white;border-radius:50%;width:48px;height:48px;font-size:1.5rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:opacity 0.3s;';
+    btn.style.cssText = 'position:fixed;bottom:2rem;right:6rem;z-index:999999;background:#4a90d9;color:white;border-radius:50%;width:64px;height:64px;font-size:2.1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.3);transition:opacity 0.3s;';
 
     doc.body.appendChild(btn);
 
     btn.addEventListener('click', function() {
-        main.scrollTo({top: 0, behavior: 'smooth'});
+        main.scrollTo({top: 0});
     });
 
     main.addEventListener('scroll', function() {
